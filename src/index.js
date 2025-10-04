@@ -1,7 +1,7 @@
 import { toggleRenderComponent } from "./entry-helpers";
 import { updateTemplateString } from "./entry-helpers";
 
-const componentName = 'Nautilus' 
+const componentName = 'tmem' 
 const codeBlockUID = `roam-render-${componentName}-cljs`;
 const renderStringCore = `{{[[roam/render]]:((${codeBlockUID}))`;
 const disabledStr = `-disabled`;
@@ -66,14 +66,14 @@ async function generateTemplateString(extensionAPI) { // returns the whole templ
 }
 
 async function onload({extensionAPI}) {
-  window.nautilusExtensionData = {running: true};
+  window.tmemExtensionData = {running: true};
 
   const panelConfig = {
       tabTitle: componentName,
       settings: 
         [{id: "workday-start",
           name: "Default workday start time",
-          description: "Default workday start time. Options are 6(am), 7(am) or 8(am) which is default. Applies to a newly inserted Nautiluses only.",
+          description: "Default workday start time. Options are 6(am), 7(am) or 8(am) which is default. Applies to a newly inserted tmemes only.",
           action: {
             type: "select",
             default: defaults['workday-start'],
@@ -85,8 +85,8 @@ async function onload({extensionAPI}) {
           }
         },
         {id:   "prefix-str",
-        name:   "Nautilus prefix",
-        description: "Your custom text preceding every newly created Nautilus spiral. E.g. #Agenda.",
+        name:   "tmem prefix",
+        description: "Your custom text preceding every newly created tmem spiral. E.g. #Agenda.",
         action: {type:  "input",
                  default: defaults['prefix-str'],
                  onChange: async (evt) => {
@@ -154,7 +154,7 @@ async function onload({extensionAPI}) {
 
 function onunload() {
   console.log(`unload ${componentName} plugin`)
-  window.nautilusExtensionData = null;
+  window.tmemExtensionData = null;
   toggleRenderComponent(false, titleblockUID, version, renderStringCore, disabledReplacementString, codeBlockUID, componentName, '');
 }
 
