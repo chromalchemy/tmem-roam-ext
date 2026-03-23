@@ -1,4 +1,4 @@
-(ns nautilus-roam-3-5-2024-v5d
+(ns tmem-roam-3-5-2024-v5d
   (:require [clojure.string :as str]
             [reagent.core :as r]
             [roam.datascript :as rd]
@@ -12,6 +12,7 @@
 (def init-len-limit 22) ;; value used when no legend length limit is specified as a render parameter
 
 (def custom-color-1 "rgba(255,0,0,0.5)")
+
 
 (def init-custom-color-1-tag "")
 
@@ -930,8 +931,9 @@
                                (arg-tag->str a4)))}))
 
 (defn main [{:keys [:block-uid]} & args]
+  (js/console.log "running tmem's extension")
   (r/with-let [is-running?    #(try
-                                  (.-running js/window.nautilusExtensionData)
+                                  (.-running js/window.tmemExtensionData)
                                  (catch :default _e
                                    false))
                *running?      (r/atom (or (is-running?)
@@ -943,10 +945,10 @@
     (case @*running?
       nil
       [:div
-       [:strong "Loading nautilus extension..."]]
+       [:strong "Loading tmem extension..."]]
       false
       [:div
-       [:strong {:style {:color "red"}} "Extension not installed. To use, please install “Nautilus” from Roam Depot."]]
+       [:strong {:style {:color "red"}} "Extension not installed. To use, please install “tmem” from Roam Depot."]]
       (do
         (reset-now-time-atom now-time-atom)
         (let [dimensions {:width (if mobile? mob-width desk-width)

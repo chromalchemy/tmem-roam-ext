@@ -145,7 +145,7 @@ async function updateBlockContentByUID(uid, content){
 export function toggleRenderComponent(state, titleblockUID, version, renderStringCore, disabledReplacementString, codeBlockUID, componentName, templateString) {
     let renderPageName = 'roam/render'
     if (state==true) {
-        replaceRenderString(disabledReplacementString, renderStringCore); // replaces all {{Nautilus-disabled}} with render component call string – backward compatibility with older versions
+        replaceRenderString(disabledReplacementString, renderStringCore); // replaces all {{tmem-disabled}} with render component call string – backward compatibility with older versions
         if (!roamAlphaAPI.data.pull("[*]", [":block/uid", codeBlockUID])) { // if the code block does not exist 
             removeTheBlock(titleblockUID); // remove the remains if these exist
             createRenderBlock(renderPageName, titleblockUID, version, codeBlockUID, componentName, templateString);
