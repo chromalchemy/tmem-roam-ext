@@ -69,7 +69,7 @@ async function onload({extensionAPI}) {
   window.nautilusExtensionData = {running: true};
 
   const panelConfig = {
-      tabTitle: componentName,
+      tabTitle: "tmem",
       settings: 
         [{id: "workday-start",
           name: "Default workday start time",
