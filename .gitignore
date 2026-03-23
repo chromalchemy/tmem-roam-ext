@@ -11,6 +11,5 @@ out
 .vscode/settings.json
 
 .DS_Store
-*extension.js
 .calva/output-window/output.calva-repl
 .portal/
