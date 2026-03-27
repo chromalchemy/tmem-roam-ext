@@ -21,11 +21,12 @@
  *     └─ {"ts":1234,"main":{...},"sidebar":[...],"focused":...}
  *
  * Command types:
- *   annotate   — {blocks: [{uid, label, intent?}]}
- *   clear      — {}
- *   get-view   — {}
- *   eval       — {code: "..."}
- *   notify     — {message: "...", intent?: "info"|"warning"|"error"|"success"}
+ *   annotate    — {blocks: [{uid, label, intent?}]}
+ *   clear       — {}
+ *   get-view    — {}
+ *   scan-blocks — {scope?: "main"|"sidebar"|"all", include_text?: bool}
+ *   eval        — {code: "..."}
+ *   notify      — {message: "...", intent?: "info"|"warning"|"error"|"success"}
  *
  * ─────────────────────────────────────────────────────────────────────
  */
@@ -47,7 +48,6 @@ let bridgePageUid = null;
 let commandsBlockUid = null;
 let stateBlockUid = null;
 let styleEl = null;
-let navObserver = null;
 let blockObserver = null;
 let pullWatchCallback = null;
 let stateInterval = null;
@@ -58,6 +58,20 @@ let processedCommandIds = new Set();
 
 function generateUID() {
   return window.roamAlphaAPI.util.generateUID();
+}
+
+/**
+ * Generate short alphabetic labels: A, B, ... Z, AA, AB, ... AZ, BA, ...
+ * Like Vimium hint labels, but pure alpha for readability.
+ */
+function indexToLabel(i) {
+  let label = "";
+  let n = i;
+  do {
+    label = String.fromCharCode(65 + (n % 26)) + label;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return label;
 }
 
 function getPageUid(title) {
@@ -173,6 +187,83 @@ function applyAnnotationsToDOM() {
   }
 }
 
+// ── Block Scanning (navigator-style) ─────────────────────────────────
+
+/**
+ * Scan DOM for visible block containers. Returns an array of
+ * {uid, label, text?, pageTitle?} in document order.
+ *
+ * scope: "main" | "sidebar" | "all" (default: "all")
+ * includeText: whether to pull the block string from Datascript
+ */
+function scanVisibleBlocks(scope = "all", includeText = true) {
+  const results = [];
+
+  // Determine root elements to scan
+  const roots = [];
+  if (scope === "main" || scope === "all") {
+    const main = document.querySelector(".roam-body-main .roam-article");
+    if (main) roots.push({ el: main, region: "main" });
+  }
+  if (scope === "sidebar" || scope === "all") {
+    const sidebar = document.querySelector("#roam-right-sidebar-content");
+    if (sidebar) roots.push({ el: sidebar, region: "sidebar" });
+  }
+
+  for (const { el: root, region } of roots) {
+    const containers = root.querySelectorAll(
+      ".roam-block-container[data-block-uid]"
+    );
+    for (const container of containers) {
+      const uid = container.getAttribute("data-block-uid");
+      if (!uid) continue;
+
+      // Skip blocks that are inside a nested/collapsed tree that's not visible
+      if (container.offsetParent === null) continue;
+
+      const entry = { uid, region };
+
+      if (includeText) {
+        // Pull block string from Datascript (fast, sync)
+        const pulled = window.roamAlphaAPI.pull(
+          "[:block/string :block/heading :node/title]",
+          [":block/uid", uid]
+        );
+        entry.text = pulled?.[":block/string"] ?? pulled?.[":node/title"] ?? "";
+      }
+
+      // Page context
+      const pageTitle = container.getAttribute("data-page-title");
+      if (pageTitle) entry.page = pageTitle;
+
+      results.push(entry);
+    }
+  }
+
+  // Assign labels in document order
+  results.forEach((entry, i) => {
+    entry.label = indexToLabel(i);
+  });
+
+  return results;
+}
+
+// ── Label→UID mapping (kept in sync with annotations) ────────────────
+
+// Active label mapping, exported to state writer
+let activeLabelMap = {}; // {"A": "uid1", "B": "uid2", ...}
+
+function updateLabelMap(scannedBlocks) {
+  activeLabelMap = {};
+  for (const { label, uid } of scannedBlocks) {
+    activeLabelMap[label] = uid;
+  }
+}
+
+function clearLabelMap() {
+  activeLabelMap = {};
+}
+
 // Re-apply annotations when Roam re-renders blocks (virtual list, navigation, expand/collapse)
 function startBlockObserver() {
   blockObserver = new MutationObserver(() => {
@@ -199,19 +290,34 @@ async function captureViewState() {
     window.roamAlphaAPI.ui.rightSidebar.getWindows(),
     window.roamAlphaAPI.ui.getFocusedBlock(),
   ]);
-  return {
+  const state = {
     ts: Date.now(),
     main: mainView,
     sidebar: sidebarWindows || [],
     focused: focused || null,
   };
+
+  // Include active label→uid mapping when annotations are present
+  const labelKeys = Object.keys(activeLabelMap);
+  if (labelKeys.length > 0) {
+    state.labels = activeLabelMap;
+  }
+
+  return state;
 }
+
+let lastStateJson = null; // track previous write to avoid churn
 
 async function writeViewState() {
   if (!stateBlockUid) return;
   try {
     const state = await captureViewState();
     const json = JSON.stringify(state);
+
+    // Skip write if nothing changed (ignore ts field for comparison)
+    const comparable = JSON.stringify({ ...state, ts: 0 });
+    if (comparable === lastStateJson) return;
+    lastStateJson = comparable;
 
     // Replace the single child of __state__, or create one
     const children = getChildren(stateBlockUid);
@@ -272,7 +378,9 @@ async function processCommand(commandBlockUid, cmd) {
   try {
     switch (type) {
       case "annotate": {
-        renderAnnotations(args?.blocks || []);
+        const blocks = args?.blocks || [];
+        renderAnnotations(blocks);
+        updateLabelMap(blocks);
         await writeResponse(commandBlockUid, id, "done", {
           count: currentAnnotations.length,
         });
@@ -281,6 +389,7 @@ async function processCommand(commandBlockUid, cmd) {
 
       case "clear": {
         clearAllAnnotations();
+        clearLabelMap();
         await writeResponse(commandBlockUid, id, "done", {});
         break;
       }
@@ -288,6 +397,35 @@ async function processCommand(commandBlockUid, cmd) {
       case "get-view": {
         const state = await captureViewState();
         await writeResponse(commandBlockUid, id, "done", state);
+        break;
+      }
+
+      case "scan-blocks": {
+        const scope = args?.scope || "all";
+        const includeText = args?.include_text !== false; // default true
+        const scanned = scanVisibleBlocks(scope, includeText);
+
+        // Render navigator-style badges on all scanned blocks
+        const annotationBlocks = scanned.map(({ uid, label }) => ({
+          uid,
+          label,
+          intent: "nav",
+        }));
+        renderAnnotations(annotationBlocks);
+        updateLabelMap(scanned);
+
+        // Build the response: full mapping with optional text
+        const mapping = scanned.map(({ uid, label, text, page, region }) => {
+          const entry = { label, uid, region };
+          if (includeText) entry.text = text;
+          if (page) entry.page = page;
+          return entry;
+        });
+
+        await writeResponse(commandBlockUid, id, "done", {
+          count: mapping.length,
+          mapping,
+        });
         break;
       }
 
@@ -464,6 +602,7 @@ export function onunload() {
   stopBlockObserver();
   stopStatePolling();
   clearAllAnnotations();
+  clearLabelMap();
   removeStyles();
   processedCommandIds.clear();
 

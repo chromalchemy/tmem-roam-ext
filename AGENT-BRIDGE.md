@@ -98,8 +98,8 @@ roam-agent/bridge               ← page (uid stored in bridgePageUid)
 │   └── {"id":"cmd-2","type":"eval","args":{…}}
 │       └── {"id":"cmd-2","status":"done","result":{"value":"my-graph"}}
 │
-└── __state__                    ← extension writes current view state (auto-polled every 2s)
-    └── {"ts":1774648294879,"main":{"type":"outline","uid":"…"},"sidebar":[],"focused":null}
+└── __state__                    ← extension writes current view state (on change, polled every 2s)
+    └── {"ts":…,"main":{…},"sidebar":[],"focused":null,"labels":{"A":"uid1","B":"uid2",…}}
 ```
 
 ## How To Tell It's Working
@@ -254,8 +254,69 @@ Snapshot the current main window, sidebar, and focused block.
   "ts": 1711234567890,
   "main": {"type": "outline", "uid": "page-uid"},
   "sidebar": [{"type": "outline", "block-uid": "...", "order": 0}],
-  "focused": {"block-uid": "...", "window-id": "..."}
+  "focused": {"block-uid": "...", "window-id": "..."},
+  "labels": {"A": "uid1", "B": "uid2"}
 }
+```
+
+The `labels` field is included when annotations are active (via `scan-blocks`
+or `annotate`). It maps visual hint labels to block UIDs.
+
+### `scan-blocks`
+
+Scan the DOM for all visible blocks, assign navigator-style labels (A, B, …
+Z, AA, AB, …), render yellow hint badges, and return the full mapping.
+
+```json
+{
+  "id": "cmd-006",
+  "type": "scan-blocks",
+  "args": {
+    "scope": "main",
+    "include_text": true
+  }
+}
+```
+
+**`scope`** (optional): `"main"` (default view), `"sidebar"`, or `"all"`
+(both). Default: `"all"`.
+
+**`include_text`** (optional): Include each block's text content in the
+response. Default: `true`.
+
+**Response:**
+```json
+{
+  "count": 8,
+  "mapping": [
+    {"label": "A", "uid": "J3n66dJ3t", "region": "main", "text": "ray salamy", "page": "March 27th, 2026"},
+    {"label": "B", "uid": "_ddHPWaGg", "region": "main", "text": "susie salamy", "page": "March 27th, 2026"},
+    {"label": "C", "uid": "miiKh8x3o", "region": "main", "text": "#math #data/viz", "page": "March 27th, 2026"}
+  ]
+}
+```
+
+The label→uid mapping is also written to `__state__.labels` so any agent
+polling state can resolve labels without re-issuing the command.
+
+Badges use the `nav` intent (yellow, compact, Vimium-style). Calling
+`scan-blocks` again re-scans and replaces all labels. Use `clear` to remove.
+
+**Typical agent workflow:**
+```
+# 1. Scan what the user is looking at
+send: {"id":"s1","type":"scan-blocks","args":{"scope":"main"}}
+→ response includes mapping with labels A–H and block text
+
+# 2. User says "move block C under block A"
+# Agent resolves: C → miiKh8x3o, A → J3n66dJ3t
+move_block(uid="miiKh8x3o", parentUid="J3n66dJ3t", order="last")
+
+# 3. Re-scan to update labels after the move
+send: {"id":"s2","type":"scan-blocks","args":{"scope":"main"}}
+
+# 4. Clear when done
+send: {"id":"s3","type":"clear","args":{}}
 ```
 
 ### `eval`
@@ -310,25 +371,27 @@ fallback div at top-right.
 
 ## View State (Proactive)
 
-The extension writes the current view state to `__state__` every 2 seconds:
+The extension polls view state every 2 seconds and writes to `__state__`
+**only when something changes** (navigation, focus, label map). Unchanged
+polls are skipped to avoid Datascript churn.
 
 ```json
 {
   "ts": 1774648294879,
-  "main": {"type": "outline", "uid": "page-uid-here", "title": "Page Title"},
-  "sidebar": [
-    {"type": "outline", "block-uid": "sidebar-uid", "order": 0, "pinned-to-top": false}
-  ],
-  "focused": {"block-uid": "focused-uid", "window-id": "main-window"}
+  "main": {"type": "outline", "uid": "03-27-2026", "title": "March 27th, 2026"},
+  "sidebar": [],
+  "focused": {"block-uid": "focused-uid", "window-id": "main-window"},
+  "labels": {"A": "J3n66dJ3t", "B": "_ddHPWaGg", "C": "miiKh8x3o"}
 }
 ```
 
+- **`labels`** — present when annotations are active (via `scan-blocks` or
+  `annotate`). Maps visual hint labels to block UIDs. Agents can resolve
+  "block B" → `_ddHPWaGg` by reading this field.
+- **`focused`** — `null` when no block is being edited.
+
 The external agent can poll this block to detect navigation and focus changes
 without needing to issue `get-view` commands.
-
-> **Known issue:** State writes happen unconditionally every 2s even when
-> nothing changes (~1,800 block updates/hour). A future improvement would
-> diff against the previous state before writing.
 
 ## In-Memory State
 
@@ -341,48 +404,68 @@ without needing to issue `get-view` commands.
 | `processedCommandIds` | `Set<string>` dedup guard, capped at 500 entries |
 | `pullWatchCallback` | Reference to the PullWatch listener (for cleanup) |
 | `stateInterval` | `setInterval` handle for the 2s view-state poll |
+| `lastStateJson` | Previous state snapshot for diff-before-write optimization |
 | `blockObserver` | `MutationObserver` on `.roam-body-main` for re-applying badges |
+| `activeLabelMap` | `{"A": "uid1", …}` — current label→uid mapping, included in state |
 
 ## Example: MCP Agent Workflow
 
+### Navigator pattern (scan → reference by label)
+
 ```
-# 1. Read current page blocks
-get_page(title="My Page")
-→ returns blocks with UIDs
-
-# 2. Annotate visible blocks with index labels
+# 1. Scan what the user sees — labels appear in Roam UI
 create_block(
   pageTitle="roam-agent/bridge",
   nestUnder="__commands__",
-  markdown='{"id":"a1","type":"annotate","args":{"blocks":[{"uid":"uid1","label":"A"},{"uid":"uid2","label":"B"},{"uid":"uid3","label":"C"}]}}'
+  markdown='{"id":"s1","type":"scan-blocks","args":{"scope":"main"}}'
 )
-→ blocks A, B, C now have blue badges in Roam UI
+→ response: {"count":8,"mapping":[{"label":"A","uid":"J3n66dJ3t","text":"ray salamy"}, ...]}
+→ yellow A–H badges appear on blocks in Roam
 
-# 3. User says "edit block B"
-# Agent knows B → uid2
-update_block(uid="uid2", string="Updated content here")
+# 2. User says "edit block C"
+# Agent resolves C → miiKh8x3o from the mapping (or from __state__.labels)
+update_block(uid="miiKh8x3o", string="Updated content here")
 
-# 4. Clear annotations when done
+# 3. Re-scan after edits to refresh labels
 create_block(
   pageTitle="roam-agent/bridge",
   nestUnder="__commands__",
-  markdown='{"id":"a2","type":"clear","args":{}}'
+  markdown='{"id":"s2","type":"scan-blocks","args":{"scope":"main"}}'
 )
 
-# 5. Poll __state__ to detect if user navigated away
+# 4. Clear when done
+create_block(
+  pageTitle="roam-agent/bridge",
+  nestUnder="__commands__",
+  markdown='{"id":"s3","type":"clear","args":{}}'
+)
+```
+
+### Manual annotate pattern (custom labels on specific blocks)
+
+```
+# Annotate specific blocks with custom labels/colours
+create_block(
+  pageTitle="roam-agent/bridge",
+  nestUnder="__commands__",
+  markdown='{"id":"a1","type":"annotate","args":{"blocks":[{"uid":"uid1","label":"A","intent":"action"},{"uid":"uid2","label":"B","intent":"success"}]}}'
+)
+
+# Poll __state__ to detect navigation or resolve labels
 get_page(title="roam-agent/bridge")
-→ read __state__ child for latest view info
+→ __state__ includes {"labels":{"A":"uid1","B":"uid2"}, ...}
 ```
 
 ## Known Issues
 
 | Severity | Issue | Notes |
 |----------|-------|-------|
-| 🟡 | State writes every 2s unconditionally | Creates unnecessary Datascript transactions even when nothing changes |
 | 🟡 | No command garbage collection | Commands accumulate under `__commands__` forever; agent must clean up |
-| 🟡 | Dedup can produce duplicate responses | PullWatch can fire twice before the dedup set catches up (observed in practice with `test-001`) |
-| 🟢 | Dead `navObserver` variable | Declared but never assigned or used |
+| 🟡 | Dedup can produce duplicate responses | PullWatch can fire twice before the dedup set catches up |
 | 🟢 | Fallback toasts don't stack | Multiple simultaneous `notify` commands overlap at the same position |
+| 🟢 | `scan-blocks` only sees rendered DOM | Collapsed children and blocks scrolled out of Roam's virtual list won't appear |
+| ✅ | ~~State writes every 2s unconditionally~~ | Fixed: diff-before-write skips unchanged state |
+| ✅ | ~~Dead `navObserver` variable~~ | Fixed: removed |
 
 ## Building
 

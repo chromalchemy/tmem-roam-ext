@@ -62,3 +62,41 @@
   background: #f6b93b;
   color: #333;
 }
+
+/* ── Navigator-style hint badges (scan-blocks) ── */
+
+.agent-badge--nav {
+  background: rgba(255, 204, 0, 0.92);
+  color: #1a1a1a;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 16px;
+  width: auto;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  border-radius: 3px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(0, 0, 0, 0.08);
+  letter-spacing: 0.5px;
+  left: -26px;
+  top: 3px;
+}
+
+/* Lighter left-border for nav annotations */
+.roam-block-container.agent-annotated > .rm-block-main .rm-block__input {
+  border-left-color: rgba(255, 204, 0, 0.6);
+}
+
+/* Override left-border colour when using non-nav intents */
+.roam-block-container.agent-annotated:has(.agent-badge--info) > .rm-block-main .rm-block__input {
+  border-left-color: #4a69bd;
+}
+.roam-block-container.agent-annotated:has(.agent-badge--action) > .rm-block-main .rm-block__input {
+  border-left-color: #e55039;
+}
+.roam-block-container.agent-annotated:has(.agent-badge--success) > .rm-block-main .rm-block__input {
+  border-left-color: #27ae60;
+}
+.roam-block-container.agent-annotated:has(.agent-badge--warn) > .rm-block-main .rm-block__input {
+  border-left-color: #f6b93b;
+}
