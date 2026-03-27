@@ -183,21 +183,22 @@ function renderAnnotations(blocks) {
 function applyAnnotationsToDOM() {
   renderingInProgress = true;
   for (const { uid, label, intent } of currentAnnotations) {
-    const blockEl = document.querySelector(
+    // querySelectorAll: badge ALL instances (main + sidebar)
+    const blockEls = document.querySelectorAll(
       `.roam-block-container[data-block-uid="${uid}"]`
     );
-    if (!blockEl) continue;
-    if (blockEl.querySelector(`.${BADGE_CLASS}`)) continue; // already rendered
+    for (const blockEl of blockEls) {
+      if (blockEl.querySelector(`.${BADGE_CLASS}`)) continue; // already rendered
 
-    blockEl.classList.add(ANNOTATED_CLASS);
+      blockEl.classList.add(ANNOTATED_CLASS);
 
-    const badge = document.createElement("div");
-    badge.className = `${BADGE_CLASS} ${BADGE_CLASS}--${intent || "info"}`;
-    badge.textContent = label;
-    badge.dataset.agentUid = uid;
+      const badge = document.createElement("div");
+      badge.className = `${BADGE_CLASS} ${BADGE_CLASS}--${intent || "info"}`;
+      badge.textContent = label;
+      badge.dataset.agentUid = uid;
 
-    // Insert as first child of the block container (before .rm-block-main)
-    blockEl.insertBefore(badge, blockEl.firstChild);
+      blockEl.insertBefore(badge, blockEl.firstChild);
+    }
   }
   renderingInProgress = false;
 }
@@ -213,6 +214,7 @@ function applyAnnotationsToDOM() {
  */
 function scanVisibleBlocks(scope = "all", includeText = true) {
   const results = [];
+  const seenUids = new Set(); // deduplicate: same block gets one label
 
   // Determine root elements to scan
   const roots = [];
@@ -221,7 +223,8 @@ function scanVisibleBlocks(scope = "all", includeText = true) {
     if (main) roots.push({ el: main, region: "main" });
   }
   if (scope === "sidebar" || scope === "all") {
-    const sidebar = document.querySelector("#roam-right-sidebar-content");
+    // #right-sidebar is the documented sidebar container
+    const sidebar = document.getElementById("right-sidebar");
     if (sidebar) roots.push({ el: sidebar, region: "sidebar" });
   }
 
@@ -233,13 +236,17 @@ function scanVisibleBlocks(scope = "all", includeText = true) {
       const uid = container.getAttribute("data-block-uid");
       if (!uid) continue;
 
-      // Skip blocks that are inside a nested/collapsed tree that's not visible
+      // Deduplicate: if this uid was already labelled (e.g. same block in
+      // main + sidebar), skip — it gets the same badge via applyAnnotationsToDOM
+      if (seenUids.has(uid)) continue;
+      seenUids.add(uid);
+
+      // Skip blocks not visible in the viewport
       if (container.offsetParent === null) continue;
 
       const entry = { uid, region };
 
       if (includeText) {
-        // Pull block string from Datascript (fast, sync)
         const pulled = window.roamAlphaAPI.pull(
           "[:block/string :block/heading :node/title]",
           [":block/uid", uid]
@@ -247,7 +254,6 @@ function scanVisibleBlocks(scope = "all", includeText = true) {
         entry.text = pulled?.[":block/string"] ?? pulled?.[":node/title"] ?? "";
       }
 
-      // Page context
       const pageTitle = container.getAttribute("data-page-title");
       if (pageTitle) entry.page = pageTitle;
 
@@ -303,9 +309,14 @@ function navRescan() {
 let lastNavViewKey = null;
 
 function viewFingerprint(state) {
-  // Capture what matters: which page/block is open, which sidebar items
+  // Capture what matters: which page/block is open, sidebar open + window list
+  const sidebarEl = document.getElementById("right-sidebar");
+  const sidebarOpen = sidebarEl
+    ? !sidebarEl.classList.contains("closed") && sidebarEl.offsetWidth > 0
+    : false;
   return JSON.stringify({
     main: state?.main?.uid,
+    sidebarOpen,
     sidebar: (state?.sidebar || []).map((w) => w?.["block-uid"] || w?.uid),
   });
 }
@@ -339,9 +350,15 @@ function startBlockObserver() {
       requestAnimationFrame(applyAnnotationsToDOM);
     }
   });
-  const target =
-    document.querySelector(".roam-body-main") || document.body;
-  blockObserver.observe(target, { childList: true, subtree: true });
+
+  // Observe both main and sidebar for block re-renders
+  const main = document.querySelector(".roam-body-main") || document.body;
+  blockObserver.observe(main, { childList: true, subtree: true });
+
+  const sidebar = document.getElementById("right-sidebar");
+  if (sidebar) {
+    blockObserver.observe(sidebar, { childList: true, subtree: true });
+  }
 }
 
 function stopBlockObserver() {
