@@ -140,17 +140,33 @@
         (roam-update-block graph uid new)
         (println (str "✏️  → \"" new "\""))))))
 
+(defn resolve-uid [state label]
+  (get (:labels state) (keyword (str/upper-case label))))
+
+(defn select-block! [graph state label]
+  (if-let [uid (resolve-uid state label)]
+    (do (roam-api graph "ui.setBlockFocusAndSelection"
+                  {"location" {"block-uid" uid "window-id" "main-window"}})
+        (let [text (or (get-block-string graph uid) "")]
+          (println (str "🎯 " (str/upper-case label) " → " uid " selected"))
+          (println (str "   \"" text "\""))))
+    (let [labels (:labels state)]
+      (println (str "⚠️  Label " (str/upper-case label) " not found."))
+      (when labels
+        (println (str "   Available: " (str/join ", " (sort (map name (keys labels))))))))))
+
 ;; ── Main ─────────────────────────────────────────────────────────────
 
 (def cli-spec
-  {:graph  {:desc "Roam graph name" :default "tmem"}
-   :on     {:desc "Turn on nav-mode" :coerce :boolean}
+  {:graph  {:desc "Roam graph name"   :default "tmem"}
+   :on     {:desc "Turn on nav-mode"  :coerce :boolean}
    :off    {:desc "Turn off nav-mode" :coerce :boolean}
    :labels {:desc "Print current label map" :coerce :boolean}
    :label  {:desc "Act on block by label character"}
+   :select {:desc "Select (focus) block by label character"}
    :scope  {:desc "Nav scope: main|sidebar|all" :default "all"}})
 
-(let [{:keys [graph on off labels label scope]}
+(let [{:keys [graph on off labels label select scope]}
       (cli/parse-opts *command-line-args* {:spec cli-spec})
       graph (or graph default-graph)
       {:keys [commands-uid state-uid]} (find-bridge-uids graph)]
@@ -163,9 +179,11 @@
     on     (nav-on! graph commands-uid scope)
     off    (nav-off! graph commands-uid)
     labels (print-labels (read-state graph state-uid))
+    select (select-block! graph (read-state graph state-uid) select)
     label  (act-on-label! graph (read-state graph state-uid) label)
     :else  (do (println "Usage:")
                (println "  bb bridge --on          # turn on nav labels")
                (println "  bb bridge --off         # turn off nav labels")
                (println "  bb bridge --labels      # show label→uid map")
+               (println "  bb bridge --select A    # select (focus) block A")
                (println "  bb bridge --label A     # act on block A"))))
