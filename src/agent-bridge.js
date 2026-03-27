@@ -272,12 +272,12 @@ function scanVisibleBlocks(scope = "all", includeText = true) {
 // ── Label→UID mapping (kept in sync with annotations) ────────────────
 
 // Active label mapping, exported to state writer
-let activeLabelMap = {}; // {"A": "uid1", "B": "uid2", ...}
+let activeLabelMap = {}; // {"A": {uid: "uid1", region: "main"}, ...}
 
 function updateLabelMap(scannedBlocks) {
   activeLabelMap = {};
-  for (const { label, uid } of scannedBlocks) {
-    activeLabelMap[label] = uid;
+  for (const { label, uid, region } of scannedBlocks) {
+    activeLabelMap[label] = { uid, region: region || "main" };
   }
 }
 
@@ -398,10 +398,10 @@ async function captureViewState() {
     focused: focused || null,
   };
 
-  // Include active label→uid mapping when annotations are present
+  // Include active label map when annotations are present
   const labelKeys = Object.keys(activeLabelMap);
   if (labelKeys.length > 0) {
-    state.labels = activeLabelMap;
+    state.labels = activeLabelMap; // {"A": {uid, region}, ...}
   }
 
   return state;

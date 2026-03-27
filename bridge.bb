@@ -113,12 +113,23 @@
     (str "navoff-" (System/currentTimeMillis)) "nav-off" {})
   (println "❌ Nav mode OFF"))
 
+(defn label-uid [labels label-kw]
+  (let [v (get labels label-kw)]
+    (if (map? v) (:uid v) v)))
+
+(defn label-region [labels label-kw]
+  (let [v (get labels label-kw)]
+    (if (map? v) (:region v) "main")))
+
 (defn print-labels [state]
   (if-let [labels (:labels state)]
     (do
       (println (str "  " (count labels) " labelled blocks:"))
-      (doseq [[label uid] (sort-by (comp str key) labels)]
-        (println (str "    " (name label) " → " uid))))
+      (doseq [[lk v] (sort-by (comp str key) labels)]
+        (let [uid (if (map? v) (:uid v) v)
+              region (if (map? v) (:region v) "")]
+          (println (str "    " (name lk) " → " uid
+                        (when (= region "sidebar") " [sidebar]"))))))
     (println "  No labels active. Send --on first.")))
 
 (defn get-block-string [graph uid]
@@ -152,15 +163,48 @@
           (read-state graph state-uid)))))
 
 (defn resolve-uid [state label]
-  (get (:labels state) (keyword (str/upper-case label))))
+  (let [v (get (:labels state) (keyword (str/upper-case label)))]
+    (if (map? v) (:uid v) v)))
+
+(defn find-window-id
+  "Determine the correct window-id for a block.
+   Uses the label region; for sidebar blocks, finds the matching sidebar window."
+  [graph state label-kw uid]
+  (let [labels  (:labels state)
+        region  (label-region labels label-kw)
+        sidebar (:sidebar state)]
+    (if (= region "sidebar")
+      (or
+        ;; Exact match: uid is the root of a sidebar window
+        (some #(when (= (:block-uid %) uid) (:window-id %)) sidebar)
+        ;; Child block: walk ancestors to find which sidebar window contains it
+        (let [sw-uids (set (map :block-uid sidebar))
+              sw-map  (into {} (map (juxt :block-uid :window-id) sidebar))]
+          (loop [cur-uid uid depth 0]
+            (when (and cur-uid (< depth 20))
+              (let [parent-uid (ffirst
+                                 (roam-q graph
+                                   (str "[:find ?pu :where
+                                          [?p :block/children ?b]
+                                          [?b :block/uid \"" cur-uid "\"]
+                                          [?p :block/uid ?pu]]")))]
+                (cond
+                  (nil? parent-uid) nil
+                  (sw-uids parent-uid) (sw-map parent-uid)
+                  :else (recur parent-uid (inc depth)))))))
+        "main-window")
+      "main-window")))
 
 (defn select-block! [graph state label]
   (if-let [uid (resolve-uid state label)]
-    (do (roam-api graph "ui.setBlockFocusAndSelection"
-                  {"location" {"block-uid" uid "window-id" "main-window"}})
-        (let [text (or (get-block-string graph uid) "")]
-          (println (str "🎯 " (str/upper-case label) " → " uid " selected"))
-          (println (str "   \"" text "\""))))
+    (let [lk   (keyword (str/upper-case label))
+          wid  (find-window-id graph state lk uid)
+          text (or (get-block-string graph uid) "")]
+      (roam-api graph "ui.setBlockFocusAndSelection"
+                {"location" {"block-uid" uid "window-id" wid}})
+      (println (str "🎯 " (str/upper-case label) " → " uid " selected"
+                    (when (not= wid "main-window") (str " [" wid "]"))))
+      (println (str "   \"" text "\"")))
     (let [labels (:labels state)]
       (println (str "⚠️  Label " (str/upper-case label) " not found."))
       (when (seq labels)
