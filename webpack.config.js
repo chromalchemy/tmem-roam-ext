@@ -1,10 +1,9 @@
 module.exports = {
     externals: {
         react: "React",
-        "chrono-node": "ChronoNode"
     },
     externalsType: "window",
-    entry: './src/index.js',
+    entry: './src/agent-bridge.js',
     output: {
         filename: 'extension.js',
         path: __dirname,
@@ -18,13 +17,9 @@ module.exports = {
     mode: "production",
     module: {
         rules: [
-            {
-            test: /\.cljs$/,
-            use: 'text-loader',
-            },
           {
             test: /\.css$/,
-            use: 'css-loader',
+            type: "asset/source",
           },
         ],
       },

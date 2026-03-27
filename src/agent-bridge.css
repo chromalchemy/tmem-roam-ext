@@ -1,0 +1,64 @@
+/* ── Agent Bridge: Block Annotation Badges ── */
+
+.agent-badge {
+  position: absolute;
+  left: -28px;
+  top: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  background: #4a69bd;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+  line-height: 20px;
+  text-align: center;
+  pointer-events: none;
+  z-index: 10;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  user-select: none;
+  opacity: 0;
+  animation: agent-badge-in 0.15s ease-out forwards;
+}
+
+@keyframes agent-badge-in {
+  from {
+    opacity: 0;
+    transform: scale(0.7) translateX(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateX(0);
+  }
+}
+
+/* Ensure the block container is positioned for the absolute badge */
+.roam-block-container.agent-annotated {
+  position: relative;
+}
+
+/* Subtle highlight on the annotated block's content area */
+.roam-block-container.agent-annotated > .rm-block-main .rm-block__input {
+  border-left: 2px solid #4a69bd;
+  padding-left: 4px;
+  border-radius: 2px;
+}
+
+/* Different badge colours by intent */
+.agent-badge--action {
+  background: #e55039;
+}
+
+.agent-badge--info {
+  background: #4a69bd;
+}
+
+.agent-badge--success {
+  background: #27ae60;
+}
+
+.agent-badge--warn {
+  background: #f6b93b;
+  color: #333;
+}
