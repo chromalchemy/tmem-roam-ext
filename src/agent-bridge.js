@@ -305,19 +305,36 @@ function navRescan() {
   writeViewState();
 }
 
-// Track the last view fingerprint so we only rescan on actual view changes
+// Track the last view fingerprint so we only rescan on actual changes
 let lastNavViewKey = null;
 
+/**
+ * Fingerprint the visible block set — cheap DOM scan, no Datascript.
+ * Captures: current page, sidebar state, and the set of visible block uids.
+ * Any new/removed/reordered block triggers a rescan.
+ */
 function viewFingerprint(state) {
-  // Capture what matters: which page/block is open, sidebar open + window list
   const sidebarEl = document.getElementById("right-sidebar");
   const sidebarOpen = sidebarEl
     ? !sidebarEl.classList.contains("closed") && sidebarEl.offsetWidth > 0
     : false;
+
+  // Collect visible block uids from the DOM (fast — no API calls)
+  const uids = [];
+  const containers = document.querySelectorAll(
+    ".roam-block-container[data-block-uid]"
+  );
+  for (const c of containers) {
+    if (c.offsetParent !== null) {
+      uids.push(c.getAttribute("data-block-uid"));
+    }
+  }
+
   return JSON.stringify({
     main: state?.main?.uid,
     sidebarOpen,
     sidebar: (state?.sidebar || []).map((w) => w?.["block-uid"] || w?.uid),
+    blocks: uids,
   });
 }
 
