@@ -58,6 +58,7 @@ let processedCommandIds = new Set();
 let navModeActive = false;
 let navModeScope = "all";
 let navRescanTimer = null;
+let renderingInProgress = false; // suppress observer during our own DOM writes
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -159,20 +160,29 @@ function removeStyles() {
 // ── Annotation Rendering ─────────────────────────────────────────────
 
 function clearAllAnnotations() {
+  renderingInProgress = true;
   document.querySelectorAll(`.${BADGE_CLASS}`).forEach((el) => el.remove());
   document
     .querySelectorAll(`.${ANNOTATED_CLASS}`)
     .forEach((el) => el.classList.remove(ANNOTATED_CLASS));
   currentAnnotations = [];
+  renderingInProgress = false;
 }
 
 function renderAnnotations(blocks) {
-  clearAllAnnotations();
+  renderingInProgress = true;
+  // Remove old badges
+  document.querySelectorAll(`.${BADGE_CLASS}`).forEach((el) => el.remove());
+  document
+    .querySelectorAll(`.${ANNOTATED_CLASS}`)
+    .forEach((el) => el.classList.remove(ANNOTATED_CLASS));
   currentAnnotations = blocks || [];
   applyAnnotationsToDOM();
+  renderingInProgress = false;
 }
 
 function applyAnnotationsToDOM() {
+  renderingInProgress = true;
   for (const { uid, label, intent } of currentAnnotations) {
     const blockEl = document.querySelector(
       `.roam-block-container[data-block-uid="${uid}"]`
@@ -190,6 +200,7 @@ function applyAnnotationsToDOM() {
     // Insert as first child of the block container (before .rm-block-main)
     blockEl.insertBefore(badge, blockEl.firstChild);
   }
+  renderingInProgress = false;
 }
 
 // ── Block Scanning (navigator-style) ─────────────────────────────────
@@ -325,11 +336,10 @@ function stopNavMode() {
 // Re-apply or rescan when Roam re-renders blocks
 function startBlockObserver() {
   blockObserver = new MutationObserver(() => {
+    if (renderingInProgress) return; // ignore our own DOM writes
     if (navModeActive) {
-      // Nav mode: debounced full rescan (blocks may have changed)
       scheduleNavRescan();
     } else if (currentAnnotations.length > 0) {
-      // Manual annotations: just re-apply existing badges
       requestAnimationFrame(applyAnnotationsToDOM);
     }
   });
