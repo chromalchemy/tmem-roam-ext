@@ -13,3 +13,4 @@ out
 .DS_Store
 .calva/output-window/output.calva-repl
 .portal/
+.portal/vs-code.edn

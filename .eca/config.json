@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "roam": {
+      "command": "npx",
+      "args": ["-y", "@roam-research/roam-mcp"]
+    }
+  }
+}
