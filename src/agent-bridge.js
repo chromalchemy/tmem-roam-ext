@@ -21,6 +21,8 @@
  *     └─ {"ts":1234,"main":{...},"sidebar":[...],"focused":...}
  *
  * Command types:
+ *   nav-mode    — {scope?: "main"|"sidebar"|"all"}  ← persistent auto-labelling
+ *   nav-off     — {}                                 ← turn off auto-labelling
  *   annotate    — {blocks: [{uid, label, intent?}]}
  *   clear       — {}
  *   get-view    — {}
@@ -53,6 +55,9 @@ let pullWatchCallback = null;
 let stateInterval = null;
 let currentAnnotations = []; // [{uid, label, intent}]
 let processedCommandIds = new Set();
+let navModeActive = false;
+let navModeScope = "all";
+let navRescanTimer = null;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -264,11 +269,67 @@ function clearLabelMap() {
   activeLabelMap = {};
 }
 
-// Re-apply annotations when Roam re-renders blocks (virtual list, navigation, expand/collapse)
+// ── Nav Mode (auto-rescan) ───────────────────────────────────────────
+
+/**
+ * Run a full rescan: scan visible blocks, render badges, update label map,
+ * and force a state write so __state__.labels is fresh.
+ */
+function navRescan() {
+  const scanned = scanVisibleBlocks(navModeScope, true);
+  const annotationBlocks = scanned.map(({ uid, label }) => ({
+    uid,
+    label,
+    intent: "nav",
+  }));
+  renderAnnotations(annotationBlocks);
+  updateLabelMap(scanned);
+  // Force state write so labels are immediately available via Local API
+  lastStateJson = null;
+  writeViewState();
+}
+
+/**
+ * Debounced rescan — called on DOM mutations when nav-mode is active.
+ * Collapses rapid-fire mutations into a single rescan.
+ */
+function scheduleNavRescan() {
+  if (!navModeActive) return;
+  if (navRescanTimer) clearTimeout(navRescanTimer);
+  navRescanTimer = setTimeout(() => {
+    navRescanTimer = null;
+    navRescan();
+  }, 150);
+}
+
+function startNavMode(scope) {
+  navModeScope = scope || "all";
+  navModeActive = true;
+  navRescan();
+  console.log(`[agent-bridge] Nav mode ON (scope: ${navModeScope})`);
+}
+
+function stopNavMode() {
+  navModeActive = false;
+  if (navRescanTimer) {
+    clearTimeout(navRescanTimer);
+    navRescanTimer = null;
+  }
+  clearAllAnnotations();
+  clearLabelMap();
+  lastStateJson = null;
+  writeViewState();
+  console.log("[agent-bridge] Nav mode OFF");
+}
+
+// Re-apply or rescan when Roam re-renders blocks
 function startBlockObserver() {
   blockObserver = new MutationObserver(() => {
-    if (currentAnnotations.length > 0) {
-      // Debounce slightly — Roam batches DOM updates
+    if (navModeActive) {
+      // Nav mode: debounced full rescan (blocks may have changed)
+      scheduleNavRescan();
+    } else if (currentAnnotations.length > 0) {
+      // Manual annotations: just re-apply existing badges
       requestAnimationFrame(applyAnnotationsToDOM);
     }
   });
@@ -397,6 +458,23 @@ async function processCommand(commandBlockUid, cmd) {
       case "get-view": {
         const state = await captureViewState();
         await writeResponse(commandBlockUid, id, "done", state);
+        break;
+      }
+
+      case "nav-mode": {
+        startNavMode(args?.scope);
+        await writeResponse(commandBlockUid, id, "done", {
+          active: true,
+          scope: navModeScope,
+          count: Object.keys(activeLabelMap).length,
+          labels: activeLabelMap,
+        });
+        break;
+      }
+
+      case "nav-off": {
+        stopNavMode();
+        await writeResponse(commandBlockUid, id, "done", { active: false });
         break;
       }
 
@@ -579,16 +657,29 @@ export async function onload({ extensionAPI }) {
   startBlockObserver();
   startStatePolling();
 
-  // Register a command palette entry for quick status check
+  // Command palette entries
   extensionAPI.ui.commandPalette.addCommand({
     label: "Agent Bridge: Show Status",
     callback: () => {
       const annotationCount = currentAnnotations.length;
       const watching = pullWatchCallback !== null;
       showFallbackToast(
-        `Agent Bridge: ${watching ? "active" : "inactive"}, ${annotationCount} annotations`,
+        `Agent Bridge: ${watching ? "active" : "inactive"}, ${annotationCount} annotations, nav: ${navModeActive ? "ON" : "OFF"}`,
         "info"
       );
+    },
+  });
+
+  extensionAPI.ui.commandPalette.addCommand({
+    label: "Agent Bridge: Toggle Nav Mode",
+    callback: () => {
+      if (navModeActive) {
+        stopNavMode();
+        showFallbackToast("Nav mode OFF", "info");
+      } else {
+        startNavMode("all");
+        showFallbackToast(`Nav mode ON — ${Object.keys(activeLabelMap).length} blocks labelled`, "success");
+      }
     },
   });
 
@@ -598,6 +689,8 @@ export async function onload({ extensionAPI }) {
 export function onunload() {
   console.log("[agent-bridge] Unloading...");
 
+  navModeActive = false;
+  if (navRescanTimer) clearTimeout(navRescanTimer);
   stopCommandWatch();
   stopBlockObserver();
   stopStatePolling();

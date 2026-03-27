@@ -1,10 +1,15 @@
 #!/usr/bin/env bb
 
-;; bridge.bb — Agent bridge client: scan, label, target, watch.
+;; bridge.bb — Agent bridge client.
 ;;
-;; Usage: bb bridge            # scan + target A + watch
-;;        bb bridge --label C  # target label C
-;;        bb bridge --no-watch # scan + target, then exit
+;; The extension handles all scanning, labelling, and refreshing.
+;; This client just reads __state__.labels and acts on blocks by label.
+;;
+;; Usage:
+;;   bb bridge --on               # turn on nav-mode labels
+;;   bb bridge --off              # turn off nav-mode labels
+;;   bb bridge --label A          # act on block labelled A
+;;   bb bridge --labels           # print current label→uid mapping
 
 (require '[babashka.http-client :as http]
          '[cheshire.core :as json]
@@ -20,48 +25,37 @@
 (defn load-token [graph]
   (let [path (str (fs/home) "/.roam-tools.json")]
     (when (fs/exists? path)
-      (-> (slurp path)
-          (json/parse-string true)
-          :graphs
+      (-> (slurp path) (json/parse-string true) :graphs
           (->> (filter #(= (:name %) graph)) first :token)))))
 
-;; ── Roam Local API client ────────────────────────────────────────────
+;; ── Roam Local API ───────────────────────────────────────────────────
 
 (defn roam-api [graph action & args]
-  (let [url     (str api-base "/" graph)
-        token   (load-token graph)
+  (let [token   (load-token graph)
         headers (cond-> {"Content-Type" "application/json"}
                   token (assoc "Authorization" (str "Bearer " token)))
-        body    (json/generate-string {:action action :args (vec args)})
-        resp    (http/post url {:headers headers :body body
-                                :throw false})
+        resp    (http/post (str api-base "/" graph)
+                           {:headers headers :throw false
+                            :body (json/generate-string
+                                    {:action action :args (vec args)})})
         data    (json/parse-string (:body resp) true)]
     (when-not (:success data)
-      (throw (ex-info (str "Roam API error: " (:error data))
-                      {:action action :response data})))
+      (throw (ex-info (str "API error: " (:error data)) {:action action})))
     (:result data)))
 
-(defn roam-q [graph query]
-  (roam-api graph "data.q" query))
+(defn roam-q [graph query] (roam-api graph "data.q" query))
 
 (defn roam-update-block [graph uid text]
-  (roam-api graph "data.block.update"
-            {"block" {"uid" uid "string" text}}))
+  (roam-api graph "data.block.update" {"block" {"uid" uid "string" text}}))
 
 (defn roam-create-block [graph parent-uid text]
   (roam-api graph "data.block.create"
             {"location" {"parent-uid" parent-uid "order" "last"}
              "block"    {"string" text}}))
 
-(defn roam-delete-block [graph uid]
-  (roam-api graph "data.block.delete"
-            {"block" {"uid" uid}}))
+;; ── Bridge helpers ───────────────────────────────────────────────────
 
-;; ── Bridge primitives ────────────────────────────────────────────────
-
-(defn find-bridge-uids
-  "Returns {:commands-uid ... :state-uid ...} or nil."
-  [graph]
+(defn find-bridge-uids [graph]
   (let [rows (roam-q graph
                "[:find ?uid ?s :where
                  [?p :node/title \"roam-agent/bridge\"]
@@ -76,23 +70,20 @@
             {} rows)))
 
 (defn read-state [graph state-uid]
-  (let [rows (roam-q graph
-               (str "[:find ?s :where
-                      [?p :block/uid \"" state-uid "\"]
-                      [?p :block/children ?c]
-                      [?c :block/string ?s]]"))]
-    (when-let [s (ffirst rows)]
-      (json/parse-string s true))))
+  (when-let [s (ffirst
+                 (roam-q graph
+                   (str "[:find ?s :where
+                          [?p :block/uid \"" state-uid "\"]
+                          [?p :block/children ?c]
+                          [?c :block/string ?s]]")))]
+    (json/parse-string s true)))
 
-(defn send-command!
-  "Send a bridge command, poll for response. Returns parsed response.
-   Polls every 50ms, times out after 3s."
-  [graph commands-uid cmd-id cmd-type args]
+(defn send-command! [graph commands-uid cmd-id cmd-type args]
   (roam-create-block graph commands-uid
     (json/generate-string {:id cmd-id :type cmd-type :args args}))
   (loop [i 0]
     (when (>= i 60)
-      (throw (ex-info "Bridge response timeout" {:cmd-id cmd-id})))
+      (throw (ex-info "Bridge timeout" {:cmd-id cmd-id})))
     (Thread/sleep 50)
     (let [rows (roam-q graph
                  (str "[:find ?s :where
@@ -101,101 +92,80 @@
                         [?cmd :block/children ?r]
                         [?r :block/string ?s]]"))
           resp (->> rows
-                    (map (fn [[s]] (try (json/parse-string s true) (catch Exception _ nil))))
+                    (map (fn [[s]] (try (json/parse-string s true)
+                                        (catch Exception _ nil))))
                     (filter #(= (:id %) cmd-id))
                     first)]
       (or resp (recur (inc i))))))
 
-(defn scan-blocks! [graph commands-uid & {:keys [scope] :or {scope "main"}}]
-  (let [cmd-id (str "scan-" (System/currentTimeMillis))]
-    (send-command! graph commands-uid cmd-id "scan-blocks"
-                   {:scope scope :include_text true})))
+;; ── Actions ──────────────────────────────────────────────────────────
 
-(defn clear! [graph commands-uid]
-  (let [cmd-id (str "clr-" (System/currentTimeMillis))]
-    (send-command! graph commands-uid cmd-id "clear" {})))
+(defn nav-on! [graph commands-uid scope]
+  (let [resp (send-command! graph commands-uid
+               (str "nav-" (System/currentTimeMillis)) "nav-mode"
+               {:scope (or scope "all")})]
+    (println (str "✅ Nav mode ON — "
+                  (count (get-in resp [:result :labels])) " blocks labelled"))
+    (:result resp)))
 
-(defn cleanup-commands! [graph commands-uid]
-  (let [rows (roam-q graph
-               (str "[:find ?uid :where
-                      [?p :block/uid \"" commands-uid "\"]
-                      [?p :block/children ?c]
-                      [?c :block/uid ?uid]]"))]
-    (doseq [[uid] rows]
-      (roam-delete-block graph uid))))
+(defn nav-off! [graph commands-uid]
+  (send-command! graph commands-uid
+    (str "navoff-" (System/currentTimeMillis)) "nav-off" {})
+  (println "❌ Nav mode OFF"))
 
-;; ── Display ──────────────────────────────────────────────────────────
+(defn print-labels [state]
+  (if-let [labels (:labels state)]
+    (do
+      (println (str "  " (count labels) " labelled blocks:"))
+      (doseq [[label uid] (sort-by (comp str key) labels)]
+        (println (str "    " (name label) " → " uid))))
+    (println "  No labels active. Send --on first.")))
 
-(defn print-mapping [mapping]
-  (println "  Label │ UID         │ Text")
-  (println "  ──────┼─────────────┼──────────────────────────────────────────")
-  (doseq [{:keys [label uid text]} mapping]
-    (printf "    %-3s │ %-11s │ %s%n"
-            label uid (subs (or text "") 0 (min (count (or text "")) 60))))
-  (println))
+(defn get-block-string [graph uid]
+  (ffirst (roam-q graph
+            (str "[:find ?s :where [?b :block/uid \"" uid "\"] [?b :block/string ?s]]"))))
 
-(defn resolve-label [mapping label]
-  (->> mapping (filter #(= (:label %) (str/upper-case label))) first))
+(defn act-on-label! [graph state label]
+  (let [labels (:labels state)
+        uid    (get labels (keyword (str/upper-case label)))]
+    (if-not uid
+      (do (println (str "⚠️  Label " (str/upper-case label) " not found."))
+          (when labels
+            (println (str "   Available: " (str/join ", " (sort (map name (keys labels))))))))
+      (let [text (or (get-block-string graph uid) "")
+            ts   (.format (java.time.LocalTime/now)
+                   (java.time.format.DateTimeFormatter/ofPattern "HH:mm:ss"))
+            new  (str text " ✅ [" ts "]")]
+        (println (str "🎯 " (str/upper-case label) " → " uid " → \"" text "\""))
+        (roam-update-block graph uid new)
+        (println (str "✏️  → \"" new "\""))))))
 
 ;; ── Main ─────────────────────────────────────────────────────────────
 
-(defn -main [opts]
-  (let [graph   (or (:graph opts) default-graph)
-        label   (or (:label opts) "A")
-        watch?  (not (:no-watch opts))
-        {:keys [commands-uid state-uid]} (find-bridge-uids graph)]
+(def cli-spec
+  {:graph  {:desc "Roam graph name" :default "tmem"}
+   :on     {:desc "Turn on nav-mode" :coerce :boolean}
+   :off    {:desc "Turn off nav-mode" :coerce :boolean}
+   :labels {:desc "Print current label map" :coerce :boolean}
+   :label  {:desc "Act on block by label character"}
+   :scope  {:desc "Nav scope: main|sidebar|all" :default "all"}})
 
-    (when-not commands-uid
-      (println "❌ Bridge not loaded. Is agent-bridge extension running?")
-      (System/exit 1))
+(let [{:keys [graph on off labels label scope]}
+      (cli/parse-opts *command-line-args* {:spec cli-spec})
+      graph (or graph default-graph)
+      {:keys [commands-uid state-uid]} (find-bridge-uids graph)]
 
-    (println (str "🔍 graph=" graph "  commands=" commands-uid "  target=" label))
+  (when-not commands-uid
+    (println "❌ Bridge not loaded.")
+    (System/exit 1))
 
-    ;; ── 1. Scan ──────────────────────────────────────────────────────
-    (let [t0      (System/currentTimeMillis)
-          resp    (scan-blocks! graph commands-uid :scope "main")
-          elapsed (- (System/currentTimeMillis) t0)
-          mapping (:mapping (:result resp))]
-
-      (println (str "📡 Scanned " (count mapping) " blocks in " elapsed "ms"))
-      (print-mapping mapping)
-
-      ;; ── 2. Target block by label ───────────────────────────────────
-      (if-let [target (resolve-label mapping label)]
-        (let [ts  (.format (java.time.LocalTime/now)
-                           (java.time.format.DateTimeFormatter/ofPattern "HH:mm:ss"))
-              new (str (:text target) " ✅ [" ts "]")]
-          (println (str "🎯 " label " → " (:uid target) " → \"" (:text target) "\""))
-          (roam-update-block graph (:uid target) new)
-          (println (str "✏️  Updated → \"" new "\"")))
-        (println (str "⚠️  Label " label " not in scan results")))
-
-      ;; ── 3. Watch loop (re-scan on view change) ────────────────────
-      (when watch?
-        (println)
-        (println "👁  Watching for view changes... (Ctrl-C to stop)")
-        (let [last-view (atom (select-keys (read-state graph state-uid)
-                                           [:main :sidebar]))]
-          (loop []
-            (Thread/sleep 1500)
-            (let [state (read-state graph state-uid)
-                  view  (select-keys state [:main :sidebar])]
-              (when (not= view @last-view)
-                (reset! last-view view)
-                (let [t0      (System/currentTimeMillis)
-                      resp    (scan-blocks! graph commands-uid :scope "main")
-                      elapsed (- (System/currentTimeMillis) t0)
-                      mapping (:mapping (:result resp))]
-                  (println (str "🔄 View changed → re-scanned " (count mapping)
-                                " blocks in " elapsed "ms"))
-                  (print-mapping mapping))))
-            (recur)))))))
-
-;; ── Entry point ──────────────────────────────────────────────────────
-
-(def cli-spec {:graph    {:desc "Roam graph name"   :default "tmem"}
-               :label    {:desc "Target badge label" :default "A"}
-               :no-watch {:desc "Exit after scan+target (no watch loop)"
-                          :coerce :boolean}})
-
-(-main (cli/parse-opts *command-line-args* {:spec cli-spec}))
+  (cond
+    on     (nav-on! graph commands-uid scope)
+    off    (nav-off! graph commands-uid)
+    labels (print-labels (read-state graph state-uid))
+    label  (act-on-label! graph (read-state graph state-uid) label)
+    :else  (do (println "Usage:")
+               (println "  bb bridge --on          # turn on nav labels")
+               (println "  bb bridge --off         # turn off nav labels")
+               (println "  bb bridge --labels      # show label→uid map")
+               (println "  bb bridge --label A     # act on block A"))))
