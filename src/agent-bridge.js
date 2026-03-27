@@ -156,7 +156,7 @@ function renderAnnotations(blocks) {
 function applyAnnotationsToDOM() {
   for (const { uid, label, intent } of currentAnnotations) {
     const blockEl = document.querySelector(
-      `.roam-block-container[id*="${uid}"]`
+      `.roam-block-container[data-block-uid="${uid}"]`
     );
     if (!blockEl) continue;
     if (blockEl.querySelector(`.${BADGE_CLASS}`)) continue; // already rendered
