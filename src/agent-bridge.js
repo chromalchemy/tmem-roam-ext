@@ -57,7 +57,6 @@ let currentAnnotations = []; // [{uid, label, intent}]
 let processedCommandIds = new Set();
 let navModeActive = false;
 let navModeScope = "all";
-let navRescanTimer = null;
 let renderingInProgress = false; // suppress observer during our own DOM writes
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -300,32 +299,30 @@ function navRescan() {
   writeViewState();
 }
 
-/**
- * Debounced rescan — called on DOM mutations when nav-mode is active.
- * Collapses rapid-fire mutations into a single rescan.
- */
-function scheduleNavRescan() {
-  if (!navModeActive) return;
-  if (navRescanTimer) clearTimeout(navRescanTimer);
-  navRescanTimer = setTimeout(() => {
-    navRescanTimer = null;
-    navRescan();
-  }, 150);
+// Track the last view fingerprint so we only rescan on actual view changes
+let lastNavViewKey = null;
+
+function viewFingerprint(state) {
+  // Capture what matters: which page/block is open, which sidebar items
+  return JSON.stringify({
+    main: state?.main?.uid,
+    sidebar: (state?.sidebar || []).map((w) => w?.["block-uid"] || w?.uid),
+  });
 }
 
-function startNavMode(scope) {
+async function startNavMode(scope) {
   navModeScope = scope || "all";
   navModeActive = true;
   navRescan();
+  // Capture initial view fingerprint
+  const state = await captureViewState();
+  lastNavViewKey = viewFingerprint(state);
   console.log(`[agent-bridge] Nav mode ON (scope: ${navModeScope})`);
 }
 
 function stopNavMode() {
   navModeActive = false;
-  if (navRescanTimer) {
-    clearTimeout(navRescanTimer);
-    navRescanTimer = null;
-  }
+  lastNavViewKey = null;
   clearAllAnnotations();
   clearLabelMap();
   lastStateJson = null;
@@ -333,13 +330,12 @@ function stopNavMode() {
   console.log("[agent-bridge] Nav mode OFF");
 }
 
-// Re-apply or rescan when Roam re-renders blocks
+// Re-attach badges when Roam re-renders blocks (virtual list recycling).
+// Never triggers a rescan — only re-applies existing annotations.
 function startBlockObserver() {
   blockObserver = new MutationObserver(() => {
-    if (renderingInProgress) return; // ignore our own DOM writes
-    if (navModeActive) {
-      scheduleNavRescan();
-    } else if (currentAnnotations.length > 0) {
+    if (renderingInProgress) return;
+    if (currentAnnotations.length > 0) {
       requestAnimationFrame(applyAnnotationsToDOM);
     }
   });
@@ -384,6 +380,27 @@ async function writeViewState() {
   try {
     const state = await captureViewState();
     const json = JSON.stringify(state);
+
+    // In nav-mode, check if view changed → rescan
+    if (navModeActive) {
+      const vfp = viewFingerprint(state);
+      if (vfp !== lastNavViewKey) {
+        lastNavViewKey = vfp;
+        navRescan();
+        // Re-capture state after rescan so labels are fresh
+        const updated = await captureViewState();
+        const updatedJson = JSON.stringify(updated);
+        const updatedComparable = JSON.stringify({ ...updated, ts: 0 });
+        lastStateJson = updatedComparable;
+        const children = getChildren(stateBlockUid);
+        if (children.length > 0) {
+          await window.roamAlphaAPI.data.block.update({
+            block: { uid: children[0].uid, string: updatedJson },
+          });
+        }
+        return;
+      }
+    }
 
     // Skip write if nothing changed (ignore ts field for comparison)
     const comparable = JSON.stringify({ ...state, ts: 0 });
