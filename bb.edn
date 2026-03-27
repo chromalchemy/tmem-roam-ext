@@ -1,0 +1,14 @@
+{:deps {org.babashka/http-server {:mvn/version "0.1.14"}}
+ :tasks
+ {serve {:doc "Serve extension files locally over HTTP (port 8888)"
+         :requires ([babashka.http-server :as server])
+         :task (do (server/serve {:port 8888 :dir "."})
+                   (println "Serving extension at http://localhost:8888/")
+                   (println "Set Roam developer extension URL to: http://localhost:8888/")
+                   (deref (promise)))}
+
+  serve-https {:doc "Serve extension files locally over HTTPS (port 8889) for Roam dev-mode"
+               :task (shell "bb serve_https.bb")}
+
+  build {:doc "Build extension.js"
+         :task (shell "npm run build")}}}

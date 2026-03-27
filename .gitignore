@@ -10,6 +10,7 @@ out
 .clj-kondo
 .vscode/settings.json
 
+.certs/
 .DS_Store
 .calva/output-window/output.calva-repl
 .portal/
