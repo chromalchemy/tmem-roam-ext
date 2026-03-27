@@ -154,15 +154,19 @@ Auto-loaded into every nREPL session. Use `(require '[roam.api :as r])`.
 
 ## Important Notes
 
+### Iframe isolation
+
+Scittle runs inside a hidden iframe to avoid clobbering Roam's compiled CLJS globals (`$APP`). The iframe uses a blob URL (same origin) so it can access `parent.window.roamAlphaAPI`. Inside the Scittle nREPL session, `js/window.roamAlphaAPI` is bridged to the real Roam API.
+
 ### This is a separate SCI from Roam's built-in one
 
 Scittle runs its own SCI interpreter. You get full access to `js/window.roamAlphaAPI` (the JS API), but **not** Roam's internal CLJS namespaces like `roam.datascript.reactive` or `reagent.core`. Those live in Roam's own SCI context.
 
 For reactive rendering, develop via the nREPL, then inject finalized code into `roam/render` blocks using the existing extension pattern.
 
-### Electron CSP
+### WebSocket / HTTPS
 
-If the CDN scripts fail to load (CSP blocking external scripts), check the Electron dev console. Fallback: download the Scittle dist files locally and serve from the extension.
+The nREPL WebSocket connects to `ws://localhost:1340`. Chromium treats `localhost` as a secure context, so this works even from HTTPS pages. The `SCITTLE_NREPL_WEBSOCKET_HOST` is set to `"localhost"` automatically.
 
 ### Connection lifecycle
 

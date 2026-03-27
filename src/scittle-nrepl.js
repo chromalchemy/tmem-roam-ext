@@ -1,9 +1,12 @@
 /**
- * Scittle nREPL injection for Roam Research (Electron).
+ * Scittle nREPL injection for Roam Research.
  *
- * Injects Scittle + plugin scripts into the page so that a local
- * bb relay (nREPL ↔ WebSocket) can connect an editor REPL to the
- * running Roam context, with full access to window.roamAlphaAPI.
+ * Loads Scittle inside a hidden about:blank IFRAME to isolate its
+ * Google Closure globals from Roam's compiled CLJS ($APP).
+ *
+ * All setup (roamAlphaAPI bridge, WebSocket monkey-patch, nREPL config)
+ * is done programmatically from the parent window into iframe.contentWindow
+ * BEFORE any scripts are loaded.  This avoids CSP issues with inline scripts.
  *
  * Usage:
  *   import { injectScittleNrepl, removeScittleNrepl } from "./scittle-nrepl";
@@ -14,26 +17,24 @@
 const SCITTLE_VERSION = "0.7.28";
 const CDN_BASE = `https://cdn.jsdelivr.net/npm/scittle@${SCITTLE_VERSION}/dist`;
 
-// Order matters: core must load first, then plugins, then nrepl last.
+const IFRAME_ID = "scittle-nrepl-iframe";
+
+// Script load order matters: core → plugins → nrepl last
 const SCRIPT_SOURCES = [
   `${CDN_BASE}/scittle.js`,
-  `${CDN_BASE}/scittle.reagent.js`,
   `${CDN_BASE}/scittle.promesa.js`,
   `${CDN_BASE}/scittle.pprint.js`,
   `${CDN_BASE}/scittle.nrepl.js`,
 ];
 
-const SCITTLE_MARKER = "data-scittle-tmem";
-
 /**
- * Load a single <script> tag and return a Promise that resolves on load.
+ * Load a <script src="..."> into an iframe document. Returns a Promise.
  */
-function loadScript(src) {
+function loadScriptInIframe(iframeDoc, src) {
   return new Promise((resolve, reject) => {
-    const el = document.createElement("script");
+    const el = iframeDoc.createElement("script");
     el.type = "application/javascript";
     el.src = src;
-    el.setAttribute(SCITTLE_MARKER, "true");
     el.onload = () => {
       console.log(`[scittle-nrepl] loaded: ${src}`);
       resolve(el);
@@ -42,62 +43,111 @@ function loadScript(src) {
       console.error(`[scittle-nrepl] FAILED to load: ${src}`, err);
       reject(err);
     };
-    document.head.appendChild(el);
+    iframeDoc.head.appendChild(el);
   });
 }
 
 /**
- * Inject Scittle + nREPL into the current page.
+ * Inject Scittle + nREPL inside an isolated iframe.
  *
  * @param {number} wsPort  WebSocket port the bb relay listens on (default 1340)
  */
 export async function injectScittleNrepl(wsPort = 1340) {
   // Guard: don't double-inject
-  if (document.querySelector(`script[${SCITTLE_MARKER}]`)) {
+  if (document.getElementById(IFRAME_ID)) {
     console.log("[scittle-nrepl] already injected, skipping");
     return;
   }
 
-  console.log("[scittle-nrepl] injecting Scittle nREPL into Roam...");
+  console.log("[scittle-nrepl] injecting Scittle nREPL (iframe-isolated) into Roam...");
 
-  // 1. Set the websocket port BEFORE loading scittle.nrepl.js
-  window.SCITTLE_NREPL_WEBSOCKET_PORT = wsPort;
+  // 1. Create a hidden about:blank iframe (same origin as parent)
+  const iframe = document.createElement("iframe");
+  iframe.id = IFRAME_ID;
+  iframe.style.display = "none";
+  iframe.style.width = "0";
+  iframe.style.height = "0";
+  iframe.style.border = "none";
+  document.body.appendChild(iframe);
 
-  // 2. Load scripts sequentially (order matters)
+  const iframeWin = iframe.contentWindow;
+  const iframeDoc = iframe.contentDocument;
+
+  // 2. Bridge: expose parent's roamAlphaAPI on the iframe's window
+  //    Scittle CLJS code uses js/window.roamAlphaAPI
+  try {
+    iframeWin.roamAlphaAPI = window.roamAlphaAPI;
+    console.log("[scittle-nrepl] roamAlphaAPI bridged to iframe");
+  } catch (e) {
+    console.error("[scittle-nrepl] Cannot bridge roamAlphaAPI:", e);
+  }
+
+  // 3. Set nREPL WebSocket config globals
+  iframeWin.SCITTLE_NREPL_WEBSOCKET_PORT = wsPort;
+  iframeWin.SCITTLE_NREPL_WEBSOCKET_HOST = "localhost";
+
+  // 4. Monkey-patch WebSocket in the iframe context
+  //    about:blank iframes have empty window.location.hostname,
+  //    so scittle.nrepl.js would produce "ws://:1340/_nrepl" (invalid).
+  //    We intercept and rewrite to ws://localhost:PORT/_nrepl.
+  const _OrigWS = iframeWin.WebSocket;
+  iframeWin.WebSocket = function (url, protocols) {
+    if (url && url.indexOf("ws://:") === 0) {
+      url = url.replace("ws://:", "ws://localhost:");
+    }
+    if (url && url.indexOf("wss://:") === 0) {
+      url = url.replace("wss://:", "wss://localhost:");
+    }
+    console.log("[scittle-nrepl] WebSocket connecting to:", url);
+    return protocols !== undefined
+      ? new _OrigWS(url, protocols)
+      : new _OrigWS(url);
+  };
+  iframeWin.WebSocket.prototype = _OrigWS.prototype;
+  iframeWin.WebSocket.CONNECTING = _OrigWS.CONNECTING;
+  iframeWin.WebSocket.OPEN = _OrigWS.OPEN;
+  iframeWin.WebSocket.CLOSING = _OrigWS.CLOSING;
+  iframeWin.WebSocket.CLOSED = _OrigWS.CLOSED;
+
+  // 5. Load Scittle scripts sequentially into the iframe
   for (const src of SCRIPT_SOURCES) {
-    await loadScript(src);
+    await loadScriptInIframe(iframeDoc, src);
   }
 
-  // 3. Register a scittle tag with the roam-api helper so it's
-  //    available in the nREPL session immediately
-  const helperTag = document.createElement("script");
-  helperTag.type = "application/x-scittle";
-  helperTag.setAttribute(SCITTLE_MARKER, "true");
-  helperTag.textContent = ROAM_API_CLJS;
-  document.head.appendChild(helperTag);
+  // 6. Inject the roam.api CLJS helper namespace
+  const cljsTag = iframeDoc.createElement("script");
+  cljsTag.type = "application/x-scittle";
+  cljsTag.textContent = ROAM_API_CLJS;
+  iframeDoc.head.appendChild(cljsTag);
 
-  // 4. Trigger scittle to evaluate the new tag
-  if (window.scittle && window.scittle.core && window.scittle.core.eval_script_tags) {
-    window.scittle.core.eval_script_tags();
+  // 7. Trigger Scittle to evaluate the CLJS tag
+  if (iframeWin.scittle && iframeWin.scittle.core && iframeWin.scittle.core.eval_script_tags) {
+    iframeWin.scittle.core.eval_script_tags();
   }
 
-  console.log("[scittle-nrepl] ✓ Scittle nREPL ready");
+  console.log("[scittle-nrepl] ✓ Scittle nREPL ready (isolated iframe)");
   console.log("[scittle-nrepl]   Run: bb roam-nrepl");
   console.log("[scittle-nrepl]   Connect editor to nREPL port 1339 (REPL type: nbb)");
+  console.log("[scittle-nrepl]   js/window.roamAlphaAPI is bridged from Roam");
 }
 
 /**
- * Remove all injected Scittle script tags.
+ * Remove the Scittle iframe.
  */
 export function removeScittleNrepl() {
-  document.querySelectorAll(`script[${SCITTLE_MARKER}]`).forEach((el) => el.remove());
-  delete window.SCITTLE_NREPL_WEBSOCKET_PORT;
+  const iframe = document.getElementById(IFRAME_ID);
+  if (iframe) {
+    iframe.remove();
+  }
   console.log("[scittle-nrepl] cleaned up");
 }
 
 /**
  * Idiomatic CLJS wrapper for roamAlphaAPI, auto-loaded into the
  * Scittle nREPL session.
+ *
+ * Inside the iframe, js/window.roamAlphaAPI points to the parent
+ * Roam window's API, so all calls work transparently.
  */
 const ROAM_API_CLJS = `
 (ns roam.api
