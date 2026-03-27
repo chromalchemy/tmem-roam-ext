@@ -82,6 +82,17 @@
   top: 3px;
 }
 
+/* Sidebar badges: can't overflow left — position inline before the bullet */
+#right-sidebar .agent-badge {
+  position: relative;
+  left: 0;
+  top: 0;
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 4px;
+  margin-left: -2px;
+}
+
 /* Lighter left-border for nav annotations */
 .roam-block-container.agent-annotated > .rm-block-main .rm-block__input {
   border-left-color: rgba(255, 204, 0, 0.6);
