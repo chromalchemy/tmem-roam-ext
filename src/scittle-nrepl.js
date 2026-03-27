@@ -67,17 +67,15 @@ try {
 var SCITTLE_NREPL_WEBSOCKET_PORT = ${wsPort};
 
 // ——— WebSocket monkey-patch ———
-// about:blank has empty window.location.hostname, which makes
-// scittle.nrepl.js produce "ws://:PORT/_nrepl" (invalid).
-// Rewrite empty hosts to localhost.
+// scittle.nrepl.js uses window.location.hostname for the WS URL,
+// but the nREPL relay always runs on localhost.  Force all nREPL
+// WebSocket connections to ws://localhost:PORT/_nrepl.
 (function() {
   var _WS = window.WebSocket;
   window.WebSocket = function(url, protocols) {
-    if (url && url.indexOf("ws://:") === 0) {
-      url = url.replace("ws://:", "ws://localhost:");
-    }
-    if (url && url.indexOf("wss://:") === 0) {
-      url = url.replace("wss://:", "wss://localhost:");
+    // Rewrite any _nrepl WebSocket URL to use localhost
+    if (url && url.indexOf("_nrepl") !== -1) {
+      url = url.replace(/^wss?:\\/\\/[^:]*:/, "ws://localhost:");
     }
     console.log("[scittle-nrepl-iframe] WebSocket:", url);
     return (protocols !== undefined)
