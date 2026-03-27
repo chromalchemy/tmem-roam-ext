@@ -140,6 +140,17 @@
         (roam-update-block graph uid new)
         (println (str "✏️  → \"" new "\""))))))
 
+(defn ensure-labels!
+  "Return state with labels, auto-enabling nav-mode if needed."
+  [graph commands-uid state-uid scope]
+  (let [state (read-state graph state-uid)]
+    (if (:labels state)
+      state
+      (do (nav-on! graph commands-uid scope)
+          ;; Re-read state after nav-mode writes labels
+          (Thread/sleep 300)
+          (read-state graph state-uid)))))
+
 (defn resolve-uid [state label]
   (get (:labels state) (keyword (str/upper-case label))))
 
@@ -152,7 +163,7 @@
           (println (str "   \"" text "\""))))
     (let [labels (:labels state)]
       (println (str "⚠️  Label " (str/upper-case label) " not found."))
-      (when labels
+      (when (seq labels)
         (println (str "   Available: " (str/join ", " (sort (map name (keys labels))))))))))
 
 ;; ── Main ─────────────────────────────────────────────────────────────
@@ -178,9 +189,9 @@
   (cond
     on     (nav-on! graph commands-uid scope)
     off    (nav-off! graph commands-uid)
-    labels (print-labels (read-state graph state-uid))
-    select (select-block! graph (read-state graph state-uid) select)
-    label  (act-on-label! graph (read-state graph state-uid) label)
+    labels (print-labels (ensure-labels! graph commands-uid state-uid scope))
+    select (select-block! graph (ensure-labels! graph commands-uid state-uid scope) select)
+    label  (act-on-label! graph (ensure-labels! graph commands-uid state-uid scope) label)
     :else  (do (println "Usage:")
                (println "  bb bridge --on          # turn on nav labels")
                (println "  bb bridge --off         # turn off nav labels")
