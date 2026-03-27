@@ -75,7 +75,14 @@ var SCITTLE_NREPL_WEBSOCKET_PORT = ${wsPort};
   window.WebSocket = function(url, protocols) {
     // Rewrite any _nrepl WebSocket URL to use localhost
     if (url && url.indexOf("_nrepl") !== -1) {
-      url = url.replace(/^wss?:\\/\\/[^:]*:/, "ws://localhost:");
+      var colonSlashSlash = url.indexOf("://");
+      if (colonSlashSlash !== -1) {
+        var afterScheme = url.substring(colonSlashSlash + 3);
+        var colonBeforePort = afterScheme.indexOf(":");
+        if (colonBeforePort !== -1) {
+          url = "ws://localhost" + afterScheme.substring(colonBeforePort);
+        }
+      }
     }
     console.log("[scittle-nrepl-iframe] WebSocket:", url);
     return (protocols !== undefined)
