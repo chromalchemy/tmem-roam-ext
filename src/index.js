@@ -1,5 +1,6 @@
 import { toggleRenderComponent } from "./entry-helpers";
 import { updateTemplateString } from "./entry-helpers";
+import { injectScittleNrepl, removeScittleNrepl } from "./scittle-nrepl";
 
 const componentName = 'tmem' 
 const codeBlockUID = `roam-render-${componentName}-cljs`;
@@ -149,12 +150,20 @@ async function onload({extensionAPI}) {
   extensionAPI.settings.panel.create(panelConfig);
 
   toggleRenderComponent(true, titleblockUID, version, renderStringCore, disabledReplacementString, codeBlockUID, componentName, await generateTemplateString(extensionAPI));
+
+  // Inject Scittle nREPL for live REPL development
+  try {
+    await injectScittleNrepl();
+  } catch (e) {
+    console.warn("[tmem] Scittle nREPL injection failed (non-fatal):", e);
+  }
   
 }
 
 function onunload() {
   console.log(`unload ${componentName} plugin`)
   window.tmemExtensionData = null;
+  removeScittleNrepl();
   toggleRenderComponent(false, titleblockUID, version, renderStringCore, disabledReplacementString, codeBlockUID, componentName, '');
 }
 

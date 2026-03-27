@@ -1,0 +1,23 @@
+{:deps {io.github.babashka/sci.nrepl
+        {:git/url "https://github.com/babashka/sci.nrepl"
+         :git/sha "2f8a9ed2d39a1b09d2b4d34d95494b56468f4a23"}}
+
+ :tasks
+ {roam-nrepl
+  {:doc "Start nREPL↔WebSocket relay for Scittle REPL in Roam"
+   :requires ([sci.nrepl.browser-server :as nrepl])
+   :task (do
+           (println "")
+           (println "  ╔══════════════════════════════════════════════╗")
+           (println "  ║  Roam Scittle nREPL Relay                   ║")
+           (println "  ║                                             ║")
+           (println "  ║  nREPL server:     localhost:1339           ║")
+           (println "  ║  WebSocket server: localhost:1340           ║")
+           (println "  ║                                             ║")
+           (println "  ║  Connect your editor to port 1339           ║")
+           (println "  ║  REPL type: nbb                             ║")
+           (println "  ╚══════════════════════════════════════════════╝")
+           (println "")
+           (nrepl/start! {:nrepl-port 1339
+                          :websocket-port 1340})
+           (deref (promise)))}}}
