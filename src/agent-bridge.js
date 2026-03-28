@@ -170,12 +170,42 @@ function clearAllAnnotations() {
 
 function renderAnnotations(blocks) {
   renderingInProgress = true;
-  // Remove old badges
-  document.querySelectorAll(`.${BADGE_CLASS}`).forEach((el) => el.remove());
-  document
-    .querySelectorAll(`.${ANNOTATED_CLASS}`)
-    .forEach((el) => el.classList.remove(ANNOTATED_CLASS));
-  currentAnnotations = blocks || [];
+  const newBlocks = blocks || [];
+  const newUids = new Set(newBlocks.map((b) => b.uid));
+
+  // Remove badges for blocks no longer in the new set
+  document.querySelectorAll(`.${BADGE_CLASS}`).forEach((el) => {
+    if (!newUids.has(el.dataset.agentUid)) {
+      const container = el.closest(`.${ANNOTATED_CLASS}`);
+      el.remove();
+      if (container && !container.querySelector(`.${BADGE_CLASS}`)) {
+        container.classList.remove(ANNOTATED_CLASS);
+      }
+    }
+  });
+
+  // Update labels on existing badges if they changed
+  const existingByUid = {};
+  document.querySelectorAll(`.${BADGE_CLASS}`).forEach((el) => {
+    const uid = el.dataset.agentUid;
+    if (!existingByUid[uid]) existingByUid[uid] = [];
+    existingByUid[uid].push(el);
+  });
+
+  for (const { uid, label, intent } of newBlocks) {
+    const existing = existingByUid[uid];
+    if (existing) {
+      // Update label text if changed
+      for (const el of existing) {
+        if (el.textContent !== label) el.textContent = label;
+        const cls = `${BADGE_CLASS} ${BADGE_CLASS}--${intent || "info"}`;
+        if (el.className !== cls) el.className = cls;
+      }
+    }
+  }
+
+  currentAnnotations = newBlocks;
+  // Add badges for new blocks not yet in the DOM
   applyAnnotationsToDOM();
   renderingInProgress = false;
 }
@@ -183,7 +213,6 @@ function renderAnnotations(blocks) {
 function applyAnnotationsToDOM() {
   renderingInProgress = true;
   for (const { uid, label, intent } of currentAnnotations) {
-    // querySelectorAll: badge ALL instances (main + sidebar)
     const blockEls = document.querySelectorAll(
       `.roam-block-container[data-block-uid="${uid}"]`
     );
