@@ -166,6 +166,15 @@
   (let [v (get (:labels state) (keyword (str/upper-case label)))]
     (if (map? v) (:uid v) v)))
 
+(defn extract-window-uid
+  "Extract the page/block uid from a sidebar window-id string.
+   e.g. 'sidebar-outline-03-26-2026' → '03-26-2026'
+        'sidebar-block-J3n66dJ3t' → 'J3n66dJ3t'"
+  [window-id]
+  (when window-id
+    (let [parts (str/split window-id #"-" 3)]
+      (when (>= (count parts) 3) (nth parts 2)))))
+
 (defn find-window-id
   "Determine the correct window-id for a block.
    Uses the label region; for sidebar blocks, finds the matching sidebar window."
@@ -175,23 +184,27 @@
         sidebar (:sidebar state)]
     (if (= region "sidebar")
       (or
-        ;; Exact match: uid is the root of a sidebar window
+        ;; Exact match: uid is a sidebar window's block-uid
         (some #(when (= (:block-uid %) uid) (:window-id %)) sidebar)
-        ;; Child block: walk ancestors to find which sidebar window contains it
-        (let [sw-uids (set (map :block-uid sidebar))
-              sw-map  (into {} (map (juxt :block-uid :window-id) sidebar))]
+        ;; Walk ancestors to find which sidebar window contains this block.
+        ;; Build set of root uids from both block-uid field and window-id parsing.
+        (let [sw-roots (into {}
+                         (for [w sidebar]
+                           (let [root (or (:block-uid w)
+                                         (extract-window-uid (:window-id w)))]
+                             (when root [root (:window-id w)]))))]
           (loop [cur-uid uid depth 0]
             (when (and cur-uid (< depth 20))
-              (let [parent-uid (ffirst
-                                 (roam-q graph
-                                   (str "[:find ?pu :where
-                                          [?p :block/children ?b]
-                                          [?b :block/uid \"" cur-uid "\"]
-                                          [?p :block/uid ?pu]]")))]
-                (cond
-                  (nil? parent-uid) nil
-                  (sw-uids parent-uid) (sw-map parent-uid)
-                  :else (recur parent-uid (inc depth)))))))
+              (if-let [wid (sw-roots cur-uid)]
+                wid
+                (let [parent-uid (ffirst
+                                   (roam-q graph
+                                     (str "[:find ?pu :where
+                                            [?p :block/children ?b]
+                                            [?b :block/uid \"" cur-uid "\"]
+                                            [?p :block/uid ?pu]]")))]
+                  (when parent-uid
+                    (recur parent-uid (inc depth))))))))
         "main-window")
       "main-window")))
 
