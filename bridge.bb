@@ -175,48 +175,59 @@
     (let [parts (str/split window-id #"-" 3)]
       (when (>= (count parts) 3) (nth parts 2)))))
 
-(defn find-window-id
-  "Determine the correct window-id for a block.
-   Uses the label region; for sidebar blocks, finds the matching sidebar window."
-  [graph state label-kw uid]
-  (let [labels  (:labels state)
-        region  (label-region labels label-kw)
-        sidebar (:sidebar state)]
-    (if (= region "sidebar")
-      (or
-        ;; Exact match: uid is a sidebar window's block-uid
-        (some #(when (= (:block-uid %) uid) (:window-id %)) sidebar)
-        ;; Walk ancestors to find which sidebar window contains this block.
-        ;; Build set of root uids from both block-uid field and window-id parsing.
-        (let [sw-roots (into {}
-                         (for [w sidebar]
-                           (let [root (or (:block-uid w)
-                                         (extract-window-uid (:window-id w)))]
-                             (when root [root (:window-id w)]))))]
-          (loop [cur-uid uid depth 0]
-            (when (and cur-uid (< depth 20))
-              (if-let [wid (sw-roots cur-uid)]
-                wid
-                (let [parent-uid (ffirst
-                                   (roam-q graph
-                                     (str "[:find ?pu :where
-                                            [?p :block/children ?b]
-                                            [?b :block/uid \"" cur-uid "\"]
-                                            [?p :block/uid ?pu]]")))]
-                  (when parent-uid
-                    (recur parent-uid (inc depth))))))))
-        "main-window")
-      "main-window")))
+(defn find-sidebar-windows
+  "Find all sidebar window-ids that contain a given block uid.
+   Returns a vec of window-id strings, ordered by sidebar window order."
+  [graph state uid]
+  (let [sidebar (sort-by :order (:sidebar state))]
+    (->> sidebar
+         (keep (fn [w]
+                 (let [root-uid (or (:block-uid w)
+                                    (extract-window-uid (:window-id w)))]
+                   ;; Check if uid IS the root or is a descendant
+                   (when root-uid
+                     (if (= root-uid uid)
+                       (:window-id w)
+                       ;; Walk ancestors
+                       (loop [cur uid depth 0]
+                         (when (and cur (< depth 20))
+                           (let [parent (ffirst
+                                          (roam-q graph
+                                            (str "[:find ?pu :where
+                                                   [?p :block/children ?b]
+                                                   [?b :block/uid \"" cur "\"]
+                                                   [?p :block/uid ?pu]]")))]
+                             (cond
+                               (nil? parent) nil
+                               (= parent root-uid) (:window-id w)
+                               :else (recur parent (inc depth)))))))))))
+         vec)))
 
-(defn select-block! [graph state label]
+(defn select-block!
+  "Select a block by label. Options:
+   :sidebar - if truthy, select in sidebar instead of main view
+              if a number, select nth sidebar instance (1-based)"
+  [graph state label {:keys [sidebar]}]
   (if-let [uid (resolve-uid state label)]
-    (let [lk   (keyword (str/upper-case label))
-          wid  (find-window-id graph state lk uid)
-          text (or (get-block-string graph uid) "")]
+    (let [text (or (get-block-string graph uid) "")
+          wid  (if sidebar
+                 (let [sw (find-sidebar-windows graph state uid)
+                       n  (if (number? sidebar) (dec sidebar) 0)]
+                   (if (seq sw)
+                     (if (< n (count sw))
+                       (nth sw n)
+                       (do (println (str "⚠️  Only " (count sw)
+                                         " sidebar instance(s), requested #" (inc n)))
+                           (last sw)))
+                     (do (println "⚠️  Block not found in any sidebar pane, using main")
+                         "main-window")))
+                 "main-window")]
       (roam-api graph "ui.setBlockFocusAndSelection"
                 {"location" {"block-uid" uid "window-id" wid}})
       (println (str "🎯 " (str/upper-case label) " → " uid " selected"
-                    (when (not= wid "main-window") (str " [" wid "]"))))
+                    (if (= wid "main-window")
+                      ""
+                      (str " [" wid "]"))))
       (println (str "   \"" text "\"")))
     (let [labels (:labels state)]
       (println (str "⚠️  Label " (str/upper-case label) " not found."))
@@ -226,17 +237,28 @@
 ;; ── Main ─────────────────────────────────────────────────────────────
 
 (def cli-spec
-  {:graph  {:desc "Roam graph name"   :default "tmem"}
-   :on     {:desc "Turn on nav-mode"  :coerce :boolean}
-   :off    {:desc "Turn off nav-mode" :coerce :boolean}
-   :labels {:desc "Print current label map" :coerce :boolean}
-   :label  {:desc "Act on block by label character"}
-   :select {:desc "Select (focus) block by label character"}
-   :scope  {:desc "Nav scope: main|sidebar|all" :default "all"}})
+  {:graph   {:desc "Roam graph name"   :default "tmem"}
+   :on      {:desc "Turn on nav-mode"  :coerce :boolean}
+   :off     {:desc "Turn off nav-mode" :coerce :boolean}
+   :labels  {:desc "Print current label map" :coerce :boolean}
+   :label   {:desc "Act on block by label character"}
+   :select  {:desc "Select (focus) block by label character"}
+   :s       {:desc "Select in sidebar (optionally nth: -s 2)"}
+   :sidebar {:desc "Select in sidebar (optionally nth: --sidebar 2)"}
+   :scope   {:desc "Nav scope: main|sidebar|all" :default "all"}})
 
-(let [{:keys [graph on off labels label select scope]}
-      (cli/parse-opts *command-line-args* {:spec cli-spec})
-      graph (or graph default-graph)
+(let [opts    (cli/parse-opts *command-line-args* {:spec cli-spec})
+      {:keys [graph on off labels label select scope]} opts
+      ;; -s and --sidebar are aliases; -s takes priority
+      ;; value can be: true (bare flag), or a number string
+      sb-raw  (or (:s opts) (:sidebar opts))
+      sb      (cond
+                (nil? sb-raw)    nil
+                (true? sb-raw)   1
+                (string? sb-raw) (or (parse-long sb-raw) 1)
+                (number? sb-raw) sb-raw
+                :else            1)
+      graph   (or graph default-graph)
       {:keys [commands-uid state-uid]} (find-bridge-uids graph)]
 
   (when-not commands-uid
@@ -247,11 +269,14 @@
     on     (nav-on! graph commands-uid scope)
     off    (nav-off! graph commands-uid)
     labels (print-labels (ensure-labels! graph commands-uid state-uid scope))
-    select (select-block! graph (ensure-labels! graph commands-uid state-uid scope) select)
+    select (select-block! graph (ensure-labels! graph commands-uid state-uid scope) select
+                          {:sidebar sb})
     label  (act-on-label! graph (ensure-labels! graph commands-uid state-uid scope) label)
     :else  (do (println "Usage:")
-               (println "  bb bridge --on          # turn on nav labels")
-               (println "  bb bridge --off         # turn off nav labels")
-               (println "  bb bridge --labels      # show label→uid map")
-               (println "  bb bridge --select A    # select (focus) block A")
-               (println "  bb bridge --label A     # act on block A"))))
+               (println "  bb bridge --on              # turn on nav labels")
+               (println "  bb bridge --off             # turn off nav labels")
+               (println "  bb bridge --labels          # show label→uid map")
+               (println "  bb bridge --select A        # select block A in main view")
+               (println "  bb bridge --select A -s     # select block A in sidebar (1st)")
+               (println "  bb bridge --select A -s 2   # select block A in sidebar (2nd)")
+               (println "  bb bridge --label A         # act on block A"))))
