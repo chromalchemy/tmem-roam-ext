@@ -505,6 +505,143 @@ function stopStatePolling() {
   stateInterval = null;
 }
 
+// ── CLJS Interop: Block Selection ─────────────────────────────────────
+
+// Cache resolved $APP symbols (they're stable within a single Roam session).
+let _cljs = null;
+
+/**
+ * Dynamically resolve munged $APP symbols by their CLJS string value.
+ * Closure Compiler renames these each Roam release, so we can't hardcode them.
+ *
+ * We need:
+ *   - setSelectedKw: the :relemma.routes.app.events/set-selected keyword
+ *   - derefFn:       cljs.core/-deref (the .J method on the IDeref protocol obj)
+ *   - PVec:          cljs.core/PersistentVector constructor
+ *   - emptyNode:     PersistentVector.EMPTY_NODE
+ */
+function resolveCljsSymbols() {
+  if (_cljs) return _cljs;
+  if (typeof $APP === "undefined") return null;
+
+  let setSelectedKw = null;
+  let PVec = null;
+  let emptyNode = null;
+  let derefObj = null;
+
+  const keys = Object.getOwnPropertyNames($APP);
+  for (const k of keys) {
+    try {
+      const v = $APP[k];
+      if (!v) continue;
+
+      // Keywords have a toString() like ":namespace/name"
+      if (
+        !setSelectedKw &&
+        typeof v === "object" &&
+        typeof v.toString === "function"
+      ) {
+        const s = v.toString();
+        if (s === ":relemma.routes.app.events/set-selected") {
+          setSelectedKw = v;
+          continue;
+        }
+      }
+
+      // PersistentVector: constructor function with EMPTY_NODE static property
+      // and fromArray static method
+      if (
+        !PVec &&
+        typeof v === "function" &&
+        v.EMPTY_NODE &&
+        v.prototype?.cljs$core$IVector$
+      ) {
+        PVec = v;
+        emptyNode = v.EMPTY_NODE;
+        continue;
+      }
+
+      // IDeref protocol object: has a .J method (the -deref impl)
+      // It's an object (not a function) with a .J that is a function
+      if (
+        !derefObj &&
+        typeof v === "object" &&
+        typeof v.J === "function" &&
+        !v.EMPTY_NODE
+      ) {
+        // Heuristic: deref objects are small protocol implementations
+        const objKeys = Object.keys(v);
+        if (objKeys.length <= 3 && objKeys.includes("J")) {
+          derefObj = v;
+        }
+      }
+    } catch (_) {
+      // Skip any properties that throw on access
+    }
+  }
+
+  if (setSelectedKw && PVec && emptyNode && derefObj) {
+    _cljs = { setSelectedKw, PVec, emptyNode, derefObj };
+    console.log("[agent-bridge] CLJS symbols resolved for block selection");
+    return _cljs;
+  }
+  return null;
+}
+
+/**
+ * Select (highlight) a block without entering edit mode.
+ * Uses Roam's internal re-frame dispatch extracted from the textarea's
+ * onBlur React prop closure.
+ *
+ * @param {HTMLTextAreaElement} textarea - the focused textarea element
+ * @param {string} blockUid - the block uid to select
+ * @returns {boolean} true if the CLJS interop path succeeded
+ */
+function selectBlockViaInternals(textarea, blockUid) {
+  const cljs = resolveCljsSymbols();
+  if (!cljs) return false;
+
+  const propsKey = Object.keys(textarea).find((k) =>
+    k.startsWith("__reactProps$")
+  );
+  const props = propsKey ? textarea[propsKey] : null;
+  if (!props?.onBlur) return false;
+
+  // Intercept cljs.core/-deref to capture the re-frame dispatch fn
+  let dispatchFn = null;
+  const origDeref = cljs.derefObj.J;
+
+  cljs.derefObj.J = function (atom) {
+    const fn = origDeref.call(cljs.derefObj, atom);
+    if (!dispatchFn) dispatchFn = fn;
+    cljs.derefObj.J = origDeref; // restore immediately
+    return fn;
+  };
+
+  // Normal onBlur — saves edits and exits edit mode
+  props.onBlur();
+  cljs.derefObj.J = origDeref; // restore (safety)
+
+  if (!dispatchFn) return false;
+
+  // Dispatch set-selected after blur settles
+  setTimeout(() => {
+    try {
+      // Build CLJS vector: [set-selected-keyword, block-uid]
+      const vec = new cljs.PVec(
+        null, 2, 5, cljs.emptyNode,
+        [cljs.setSelectedKw, blockUid], null
+      );
+      if (dispatchFn.J) dispatchFn.J(vec);
+      else dispatchFn(vec);
+    } catch (e) {
+      console.warn("[agent-bridge] set-selected dispatch failed:", e);
+    }
+  }, 100);
+
+  return true;
+}
+
 // ── Command Processing ───────────────────────────────────────────────
 
 async function writeResponse(commandBlockUid, id, status, result) {
@@ -592,75 +729,30 @@ async function processCommand(commandBlockUid, cmd) {
           //
           // There is no Roam API for block-level selection. Synthetic
           // KeyboardEvents are ignored (isTrusted check). Instead, we
-          // reach into Roam's compiled ClojureScript internals:
+          // reach into Roam's compiled CLJS internals:
           //
-          // 1. The textarea's React onBlur prop is a closure that captures
-          //    a re-frame dispatch function (via $APP.aL / cljs deref).
-          // 2. We intercept that deref to capture the dispatch fn.
-          // 3. Call onBlur() normally (saves edits, exits edit mode).
-          // 4. Dispatch :relemma.routes.app.events/set-selected with the
-          //    block uid to leave the block in "selected" (highlighted) state.
+          // 1. The textarea's React onBlur prop captures a re-frame
+          //    dispatch fn via CLJS deref. We intercept deref to grab it.
+          // 2. Call onBlur() normally (saves edits, exits edit mode).
+          // 3. Dispatch :relemma.routes.app.events/set-selected with the
+          //    block uid → block ends up highlighted (not editing).
           //
-          // $APP is Roam's compiled CLJS namespace. Key symbols:
-          //   $APP.aL.J  — cljs.core/-deref (IDeref protocol method)
-          //   $APP.p5a   — :relemma.routes.app.events/set-selected keyword
-          //   $APP.Q     — cljs.core/PersistentVector constructor
-          //   $APP.R     — PersistentVector.EMPTY_NODE
+          // Symbol names are munged by Closure Compiler and change each
+          // Roam release, so we resolve them dynamically by their CLJS
+          // string representation (toString on keywords/constructors).
           await new Promise((resolve) => {
             let attempts = 0;
             const check = () => {
               const ta = document.activeElement;
               if (ta?.tagName === "TEXTAREA") {
                 try {
-                  const propsKey = Object.keys(ta).find((k) =>
-                    k.startsWith("__reactProps$")
-                  );
-                  const props = propsKey ? ta[propsKey] : null;
-
-                  if (
-                    props?.onBlur &&
-                    typeof $APP !== "undefined" &&
-                    $APP.aL &&
-                    $APP.p5a &&
-                    $APP.Q &&
-                    $APP.R
-                  ) {
-                    // Capture the re-frame dispatch fn from onBlur's closure
-                    let dispatchFn = null;
-                    const origDeref = $APP.aL.J;
-                    $APP.aL.J = function (atom) {
-                      const fn = origDeref.call($APP.aL, atom);
-                      if (!dispatchFn) dispatchFn = fn;
-                      $APP.aL.J = origDeref;
-                      return fn;
-                    };
-
-                    // Normal onBlur — saves edits and exits edit mode
-                    props.onBlur();
-                    $APP.aL.J = origDeref; // restore in case onBlur didn't trigger deref
-
-                    if (dispatchFn) {
-                      // Dispatch set-selected after blur settles
-                      setTimeout(() => {
-                        try {
-                          const vec = new $APP.Q(
-                            null, 2, 5, $APP.R,
-                            [$APP.p5a, uid], null
-                          );
-                          if (dispatchFn.J) dispatchFn.J(vec);
-                          else dispatchFn(vec);
-                        } catch (e) {
-                          console.warn("[agent-bridge] set-selected dispatch failed:", e);
-                        }
-                        resolve();
-                      }, 100);
-                      return;
-                    }
+                  if (typeof $APP !== "undefined" && selectBlockViaInternals(ta, uid)) {
+                    resolve();
+                    return;
                   }
                 } catch (e) {
                   console.warn("[agent-bridge] focus mode CLJS interop failed:", e);
                 }
-
                 // Fallback: just blur the textarea
                 ta.blur();
                 resolve();
@@ -904,6 +996,7 @@ export function onunload() {
   clearLabelMap();
   removeStyles();
   processedCommandIds.clear();
+  _cljs = null;
 
   bridgePageUid = null;
   commandsBlockUid = null;
