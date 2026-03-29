@@ -206,8 +206,10 @@
 (defn select-block!
   "Select a block by label. Options:
    :sidebar - if truthy, select in sidebar instead of main view
-              if a number, select nth sidebar instance (1-based)"
-  [graph state label {:keys [sidebar]}]
+              if a number, select nth sidebar instance (1-based)
+   :edit    - if truthy, focus block text for editing (cursor in textarea)
+              otherwise, highlight/select the block without entering edit mode"
+  [graph commands-uid state label {:keys [sidebar edit]}]
   (if-let [uid (resolve-uid state label)]
     (let [text (or (get-block-string graph uid) "")
           wid  (if sidebar
@@ -221,10 +223,14 @@
                            (last sw)))
                      (do (println "⚠️  Block not found in any sidebar pane, using main")
                          "main-window")))
-                 "main-window")]
-      (roam-api graph "ui.setBlockFocusAndSelection"
-                {"location" {"block-uid" uid "window-id" wid}})
-      (println (str "🎯 " (str/upper-case label) " → " uid " selected"
+                 "main-window")
+          mode (if edit "edit" "focus")]
+      (send-command! graph commands-uid
+        (str "sel-" (System/currentTimeMillis)) "select-block"
+        {:uid uid :window_id wid :mode mode})
+      (println (str (if edit "✏️  " "🎯 ")
+                    (str/upper-case label) " → " uid
+                    (if edit " editing" " selected")
                     (if (= wid "main-window")
                       ""
                       (str " [" wid "]"))))
@@ -242,7 +248,9 @@
    :off     {:desc "Turn off nav-mode" :coerce :boolean}
    :labels  {:desc "Print current label map" :coerce :boolean}
    :label   {:desc "Act on block by label character"}
-   :select  {:desc "Select (focus) block by label character"}
+   :select  {:desc "Select (highlight) block by label character"}
+   :e       {:desc "Edit mode: focus block text for typing" :coerce :boolean}
+   :edit    {:desc "Edit mode: focus block text for typing" :coerce :boolean}
    :s       {:desc "Select in sidebar (optionally nth: -s 2)"}
    :sidebar {:desc "Select in sidebar (optionally nth: --sidebar 2)"}
    :scope   {:desc "Nav scope: main|sidebar|all" :default "all"}})
@@ -258,6 +266,8 @@
                 (string? sb-raw) (or (parse-long sb-raw) 1)
                 (number? sb-raw) sb-raw
                 :else            1)
+      ;; -e and --edit are aliases
+      edit?   (or (:e opts) (:edit opts))
       graph   (or graph default-graph)
       {:keys [commands-uid state-uid]} (find-bridge-uids graph)]
 
@@ -269,14 +279,16 @@
     on     (nav-on! graph commands-uid scope)
     off    (nav-off! graph commands-uid)
     labels (print-labels (ensure-labels! graph commands-uid state-uid scope))
-    select (select-block! graph (ensure-labels! graph commands-uid state-uid scope) select
-                          {:sidebar sb})
+    select (select-block! graph commands-uid
+                          (ensure-labels! graph commands-uid state-uid scope) select
+                          {:sidebar sb :edit edit?})
     label  (act-on-label! graph (ensure-labels! graph commands-uid state-uid scope) label)
     :else  (do (println "Usage:")
                (println "  bb bridge --on              # turn on nav labels")
                (println "  bb bridge --off             # turn off nav labels")
                (println "  bb bridge --labels          # show label→uid map")
-               (println "  bb bridge --select A        # select block A in main view")
-               (println "  bb bridge --select A -s     # select block A in sidebar (1st)")
-               (println "  bb bridge --select A -s 2   # select block A in sidebar (2nd)")
+               (println "  bb bridge --select A        # highlight block A")
+               (println "  bb bridge --select A -e     # focus block A for editing")
+               (println "  bb bridge --select A -s     # highlight block A in sidebar")
+               (println "  bb bridge --select A -s -e  # edit block A in sidebar")
                (println "  bb bridge --label A         # act on block A"))))

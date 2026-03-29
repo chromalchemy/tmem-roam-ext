@@ -28,6 +28,7 @@
  *   get-view    — {}
  *   scan-blocks — {scope?: "main"|"sidebar"|"all", include_text?: bool}
  *   eval        — {code: "..."}
+ *   select-block— {uid, window_id?, mode?: "focus"|"edit"}  ← focus or edit a block
  *   notify      — {message: "...", intent?: "info"|"warning"|"error"|"success"}
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -565,6 +566,121 @@ async function processCommand(commandBlockUid, cmd) {
       case "nav-off": {
         stopNavMode();
         await writeResponse(commandBlockUid, id, "done", { active: false });
+        break;
+      }
+
+      case "select-block": {
+        const uid = args?.uid;
+        const windowId = args?.window_id || "main-window";
+        const mode = args?.mode || "focus"; // "focus" = highlight, "edit" = text input
+
+        if (!uid) {
+          await writeResponse(commandBlockUid, id, "error", {
+            error: "No uid provided",
+          });
+          break;
+        }
+
+        // Both modes start the same: use the API to focus the block.
+        // This handles scrolling, virtual list, and sidebar window-id routing.
+        await window.roamAlphaAPI.ui.setBlockFocusAndSelection({
+          location: { "block-uid": uid, "window-id": windowId },
+        });
+
+        if (mode === "focus") {
+          // Transition from editing → block-selected (highlighted, not editing).
+          //
+          // There is no Roam API for block-level selection. Synthetic
+          // KeyboardEvents are ignored (isTrusted check). Instead, we
+          // reach into Roam's compiled ClojureScript internals:
+          //
+          // 1. The textarea's React onBlur prop is a closure that captures
+          //    a re-frame dispatch function (via $APP.aL / cljs deref).
+          // 2. We intercept that deref to capture the dispatch fn.
+          // 3. Call onBlur() normally (saves edits, exits edit mode).
+          // 4. Dispatch :relemma.routes.app.events/set-selected with the
+          //    block uid to leave the block in "selected" (highlighted) state.
+          //
+          // $APP is Roam's compiled CLJS namespace. Key symbols:
+          //   $APP.aL.J  — cljs.core/-deref (IDeref protocol method)
+          //   $APP.p5a   — :relemma.routes.app.events/set-selected keyword
+          //   $APP.Q     — cljs.core/PersistentVector constructor
+          //   $APP.R     — PersistentVector.EMPTY_NODE
+          await new Promise((resolve) => {
+            let attempts = 0;
+            const check = () => {
+              const ta = document.activeElement;
+              if (ta?.tagName === "TEXTAREA") {
+                try {
+                  const propsKey = Object.keys(ta).find((k) =>
+                    k.startsWith("__reactProps$")
+                  );
+                  const props = propsKey ? ta[propsKey] : null;
+
+                  if (
+                    props?.onBlur &&
+                    typeof $APP !== "undefined" &&
+                    $APP.aL &&
+                    $APP.p5a &&
+                    $APP.Q &&
+                    $APP.R
+                  ) {
+                    // Capture the re-frame dispatch fn from onBlur's closure
+                    let dispatchFn = null;
+                    const origDeref = $APP.aL.J;
+                    $APP.aL.J = function (atom) {
+                      const fn = origDeref.call($APP.aL, atom);
+                      if (!dispatchFn) dispatchFn = fn;
+                      $APP.aL.J = origDeref;
+                      return fn;
+                    };
+
+                    // Normal onBlur — saves edits and exits edit mode
+                    props.onBlur();
+                    $APP.aL.J = origDeref; // restore in case onBlur didn't trigger deref
+
+                    if (dispatchFn) {
+                      // Dispatch set-selected after blur settles
+                      setTimeout(() => {
+                        try {
+                          const vec = new $APP.Q(
+                            null, 2, 5, $APP.R,
+                            [$APP.p5a, uid], null
+                          );
+                          if (dispatchFn.J) dispatchFn.J(vec);
+                          else dispatchFn(vec);
+                        } catch (e) {
+                          console.warn("[agent-bridge] set-selected dispatch failed:", e);
+                        }
+                        resolve();
+                      }, 100);
+                      return;
+                    }
+                  }
+                } catch (e) {
+                  console.warn("[agent-bridge] focus mode CLJS interop failed:", e);
+                }
+
+                // Fallback: just blur the textarea
+                ta.blur();
+                resolve();
+              } else if (attempts < 20) {
+                attempts++;
+                setTimeout(check, 50);
+              } else {
+                resolve();
+              }
+            };
+            setTimeout(check, 100);
+          });
+        }
+        // mode === "edit": nothing else needed, textarea is already focused
+
+        await writeResponse(commandBlockUid, id, "done", {
+          uid,
+          mode,
+          window_id: windowId,
+        });
         break;
       }
 
