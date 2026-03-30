@@ -668,16 +668,6 @@ async function processCommand(commandBlockUid, cmd) {
   const { id, type, args } = cmd;
 
   if (processedCommandIds.has(id)) return;
-
-  // Skip commands that already have a response child — they were processed
-  // in a previous session. Without this check, PullWatch fires on startup
-  // and re-executes ALL old commands (including dangerous eval commands).
-  const existingChildren = getChildren(commandBlockUid);
-  if (existingChildren.length > 0) {
-    processedCommandIds.add(id);
-    return;
-  }
-
   processedCommandIds.add(id);
 
   // Cap the processed set to prevent unbounded growth
@@ -948,6 +938,22 @@ function showFallbackToast(message, intent) {
 
 function startCommandWatch() {
   if (!commandsBlockUid) return;
+
+  // Pre-seed processedCommandIds with all existing commands so the first
+  // PullWatch fire doesn't re-process old commands. This replaces the
+  // expensive per-command getChildren check.
+  const existingCmds = getChildren(commandsBlockUid);
+  for (const { string: str } of existingCmds) {
+    try {
+      const cmd = JSON.parse(str);
+      if (cmd.id) processedCommandIds.add(cmd.id);
+    } catch (_) {}
+  }
+  if (existingCmds.length > 0) {
+    console.log(
+      `[agent-bridge] Pre-seeded ${processedCommandIds.size} existing command IDs`
+    );
+  }
 
   pullWatchCallback = (_before, after) => {
     // after is the new state of the __commands__ block and its children

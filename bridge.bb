@@ -162,10 +162,9 @@
   (let [state (read-state graph state-uid)]
     (if (:labels state)
       state
-      (do (nav-on! graph commands-uid scope)
-          ;; Re-read state after nav-mode writes labels
-          (Thread/sleep 300)
-          (read-state graph state-uid)))))
+      ;; nav-on! response includes labels — use directly, no re-read needed
+      (let [result (nav-on! graph commands-uid scope)]
+        {:labels (:labels result)}))))
 
 (defn resolve-uid [state label]
   (let [v (get (:labels state) (keyword (str/upper-case label)))]
