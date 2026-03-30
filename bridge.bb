@@ -204,41 +204,52 @@
          vec)))
 
 (defn select-block!
-  "Select a block by label. Options:
+  "Select block(s) by label. Accepts a single label or comma-separated labels.
+   Options:
    :sidebar - if truthy, select in sidebar instead of main view
               if a number, select nth sidebar instance (1-based)
    :edit    - if truthy, focus block text for editing (cursor in textarea)
-              otherwise, highlight/select the block without entering edit mode"
-  [graph commands-uid state label {:keys [sidebar edit]}]
-  (if-let [uid (resolve-uid state label)]
-    (let [text (or (get-block-string graph uid) "")
-          wid  (if sidebar
-                 (let [sw (find-sidebar-windows graph state uid)
-                       n  (if (number? sidebar) (dec sidebar) 0)]
-                   (if (seq sw)
-                     (if (< n (count sw))
-                       (nth sw n)
-                       (do (println (str "⚠️  Only " (count sw)
-                                         " sidebar instance(s), requested #" (inc n)))
-                           (last sw)))
-                     (do (println "⚠️  Block not found in any sidebar pane, using main")
-                         "main-window")))
-                 "main-window")
-          mode (if edit "edit" "focus")]
-      (send-command! graph commands-uid
-        (str "sel-" (System/currentTimeMillis)) "select-block"
-        {:uid uid :window_id wid :mode mode})
-      (println (str (if edit "✏️  " "🎯 ")
-                    (str/upper-case label) " → " uid
-                    (if edit " editing" " selected")
-                    (if (= wid "main-window")
-                      ""
-                      (str " [" wid "]"))))
-      (println (str "   \"" text "\"")))
-    (let [labels (:labels state)]
-      (println (str "⚠️  Label " (str/upper-case label) " not found."))
-      (when (seq labels)
-        (println (str "   Available: " (str/join ", " (sort (map name (keys labels))))))))))
+              otherwise, highlight/select the block(s) without entering edit mode"
+  [graph commands-uid state label-str {:keys [sidebar edit]}]
+  (let [labels (map str/trim (str/split (str/upper-case label-str) #","))
+        resolved (keep (fn [lbl]
+                         (when-let [uid (resolve-uid state lbl)]
+                           {:label lbl :uid uid
+                            :text (or (get-block-string graph uid) "")}))
+                       labels)
+        missing  (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) labels)]
+
+    (when (seq missing)
+      (println (str "⚠️  Label(s) not found: " (str/join ", " missing)))
+      (when-let [labels (:labels state)]
+        (println (str "   Available: " (str/join ", " (sort (map name (keys labels))))))))
+
+    (when (seq resolved)
+      (let [uids (mapv :uid resolved)
+            ;; For sidebar, resolve window-id from first block
+            first-uid (first uids)
+            wid  (if sidebar
+                   (let [sw (find-sidebar-windows graph state first-uid)
+                         n  (if (number? sidebar) (dec sidebar) 0)]
+                     (if (seq sw)
+                       (if (< n (count sw))
+                         (nth sw n)
+                         (do (println (str "⚠️  Only " (count sw)
+                                           " sidebar instance(s), requested #" (inc n)))
+                             (last sw)))
+                       (do (println "⚠️  Block not found in any sidebar pane, using main")
+                           "main-window")))
+                   "main-window")
+            mode (if edit "edit" "focus")]
+        (send-command! graph commands-uid
+          (str "sel-" (System/currentTimeMillis)) "select-block"
+          {:uids uids :window_id wid :mode mode})
+        (doseq [{:keys [label uid text]} resolved]
+          (println (str (if edit "✏️  " "🎯 ")
+                        label " → " uid
+                        (if edit " editing" " selected")
+                        (if (= wid "main-window") "" (str " [" wid "]"))))
+          (println (str "   \"" text "\"")))))))
 
 ;; ── Main ─────────────────────────────────────────────────────────────
 
@@ -288,6 +299,7 @@
                (println "  bb bridge --off             # turn off nav labels")
                (println "  bb bridge --labels          # show label→uid map")
                (println "  bb bridge --select A        # highlight block A")
+               (println "  bb bridge --select A,B,C    # highlight multiple blocks")
                (println "  bb bridge --select A -e     # focus block A for editing")
                (println "  bb bridge --select A -s     # highlight block A in sidebar")
                (println "  bb bridge --select A -s -e  # edit block A in sidebar")

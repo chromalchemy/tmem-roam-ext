@@ -28,7 +28,7 @@
  *   get-view    — {}
  *   scan-blocks — {scope?: "main"|"sidebar"|"all", include_text?: bool}
  *   eval        — {code: "..."}
- *   select-block— {uid, window_id?, mode?: "focus"|"edit"}  ← focus or edit a block
+ *   select-block— {uid|uids, window_id?, mode?: "focus"|"edit"}  ← highlight or edit block(s)
  *   notify      — {message: "...", intent?: "info"|"warning"|"error"|"success"}
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -723,84 +723,83 @@ async function processCommand(commandBlockUid, cmd) {
       }
 
       case "select-block": {
-        const uid = args?.uid;
+        // Accept single uid or array of uids
+        const uids = args?.uids || (args?.uid ? [args.uid] : []);
         const windowId = args?.window_id || "main-window";
         const mode = args?.mode || "focus"; // "focus" = highlight, "edit" = text input
 
-        if (!uid) {
+        if (uids.length === 0) {
           await writeResponse(commandBlockUid, id, "error", {
-            error: "No uid provided",
+            error: "No uid(s) provided",
           });
           break;
         }
 
         if (mode === "edit") {
-          // Edit mode: use the API to focus the block textarea.
+          // Edit mode: focus the first block's textarea (can only edit one).
           await window.roamAlphaAPI.ui.setBlockFocusAndSelection({
-            location: { "block-uid": uid, "window-id": windowId },
+            location: { "block-uid": uids[0], "window-id": windowId },
           });
         } else {
-          // Focus mode: scroll to block and highlight it WITHOUT entering
-          // edit mode. setBlockFocusAndSelection always enters edit and we
-          // cannot cleanly exit it (no API, synthetic Escape is ignored,
-          // CLJS internals are too fragile across Roam versions).
-          //
-          // Instead, find the block in the DOM directly (nav-mode blocks
-          // are always visible since they were scanned), scroll to it,
-          // and apply a brief CSS highlight pulse.
+          // Focus mode: highlight block(s) WITHOUT entering edit mode.
+          // Find blocks in the DOM directly (nav-mode blocks are always
+          // visible since they were scanned), scroll to them, and apply
+          // a persistent highlight.
 
           // First: dismiss any block currently in edit mode.
-          // Clicking the page title (or empty area) naturally exits
-          // any block editing in Roam — this is the most reliable
-          // way since API/React blur methods don't trigger the
-          // internal state transition.
           if (document.activeElement?.tagName === "TEXTAREA") {
-            const title = document.querySelector(".rm-title-display, .roam-article .rm-title-display");
+            const title = document.querySelector(
+              ".rm-title-display, .roam-article .rm-title-display"
+            );
             if (title) {
               title.click();
             } else {
-              // Fallback: click the article area
-              const article = document.querySelector(".roam-body-main .roam-article");
+              const article = document.querySelector(
+                ".roam-body-main .roam-article"
+              );
               if (article) article.click();
             }
-            // Brief wait for Roam to process the click and exit edit mode
             await new Promise((r) => setTimeout(r, 50));
           }
 
-          const selector = `.roam-block-container[data-block-uid="${uid}"]`;
-          let blockEl = null;
+          // Clear any previous selection highlight
+          clearSelectHighlight();
 
-          if (windowId === "main-window") {
-            const main = document.querySelector(".roam-body-main");
-            blockEl = main?.querySelector(selector);
-          } else {
-            const sidebar = document.getElementById("right-sidebar");
-            if (sidebar) blockEl = sidebar.querySelector(selector);
+          const root =
+            windowId === "main-window"
+              ? document.querySelector(".roam-body-main")
+              : document.getElementById("right-sidebar");
+
+          let scrollTarget = null;
+          for (const blockUid of uids) {
+            const selector = `.roam-block-container[data-block-uid="${blockUid}"]`;
+            const blockEl = root?.querySelector(selector);
+            if (blockEl) {
+              blockEl.classList.add("agent-select-highlight");
+              if (!scrollTarget) scrollTarget = blockEl;
+            }
           }
 
-          if (blockEl) {
-            blockEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
-            // Persistent highlight — cleared on next click anywhere
-            clearSelectHighlight();
-            blockEl.classList.add("agent-select-highlight");
-            const clearOnClick = () => {
-              clearSelectHighlight();
-              document.removeEventListener("click", clearOnClick, true);
-              document.removeEventListener("keydown", clearOnClick, true);
-            };
-            document.addEventListener("click", clearOnClick, true);
-            document.addEventListener("keydown", clearOnClick, true);
-          } else {
-            // Block not in DOM (scrolled out of virtual list) — fall back
-            // to API focus as best effort.
-            await window.roamAlphaAPI.ui.setBlockFocusAndSelection({
-              location: { "block-uid": uid, "window-id": windowId },
+          // Scroll the first highlighted block into view
+          if (scrollTarget) {
+            scrollTarget.scrollIntoView({
+              block: "nearest",
+              behavior: "smooth",
             });
           }
+
+          // Clear highlights on next user interaction
+          const clearOnInteract = () => {
+            clearSelectHighlight();
+            document.removeEventListener("click", clearOnInteract, true);
+            document.removeEventListener("keydown", clearOnInteract, true);
+          };
+          document.addEventListener("click", clearOnInteract, true);
+          document.addEventListener("keydown", clearOnInteract, true);
         }
 
         await writeResponse(commandBlockUid, id, "done", {
-          uid,
+          uids,
           mode,
           window_id: windowId,
         });
