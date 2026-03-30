@@ -233,6 +233,12 @@ function applyAnnotationsToDOM() {
   renderingInProgress = false;
 }
 
+function clearSelectHighlight() {
+  document
+    .querySelectorAll(".agent-select-highlight")
+    .forEach((el) => el.classList.remove("agent-select-highlight"));
+}
+
 // ── Block Scanning (navigator-style) ─────────────────────────────────
 
 /**
@@ -728,55 +734,70 @@ async function processCommand(commandBlockUid, cmd) {
           break;
         }
 
-        // Both modes start the same: use the API to focus the block.
-        // This handles scrolling, virtual list, and sidebar window-id routing.
-        await window.roamAlphaAPI.ui.setBlockFocusAndSelection({
-          location: { "block-uid": uid, "window-id": windowId },
-        });
-
-        if (mode === "focus") {
-          // Transition from editing → block-selected (highlighted, not editing).
-          //
-          // There is no Roam API for block-level selection. Synthetic
-          // KeyboardEvents are ignored (isTrusted check). Instead, we
-          // reach into Roam's compiled CLJS internals:
-          //
-          // 1. The textarea's React onBlur prop captures a re-frame
-          //    dispatch fn via CLJS deref. We intercept deref to grab it.
-          // 2. Call onBlur() normally (saves edits, exits edit mode).
-          // 3. Dispatch :relemma.routes.app.events/set-selected with the
-          //    block uid → block ends up highlighted (not editing).
-          //
-          // Symbol names are munged by Closure Compiler and change each
-          // Roam release, so we resolve them dynamically by their CLJS
-          // string representation (toString on keywords/constructors).
-          await new Promise((resolve) => {
-            let attempts = 0;
-            const check = () => {
-              const ta = document.activeElement;
-              if (ta?.tagName === "TEXTAREA") {
-                try {
-                  if (typeof $APP !== "undefined" && selectBlockViaInternals(ta, uid)) {
-                    resolve();
-                    return;
-                  }
-                } catch (e) {
-                  console.warn("[agent-bridge] focus mode CLJS interop failed:", e);
-                }
-                // Fallback: just blur the textarea
-                ta.blur();
-                resolve();
-              } else if (attempts < 20) {
-                attempts++;
-                setTimeout(check, 50);
-              } else {
-                resolve();
-              }
-            };
-            setTimeout(check, 100);
+        if (mode === "edit") {
+          // Edit mode: use the API to focus the block textarea.
+          await window.roamAlphaAPI.ui.setBlockFocusAndSelection({
+            location: { "block-uid": uid, "window-id": windowId },
           });
+        } else {
+          // Focus mode: scroll to block and highlight it WITHOUT entering
+          // edit mode. setBlockFocusAndSelection always enters edit and we
+          // cannot cleanly exit it (no API, synthetic Escape is ignored,
+          // CLJS internals are too fragile across Roam versions).
+          //
+          // Instead, find the block in the DOM directly (nav-mode blocks
+          // are always visible since they were scanned), scroll to it,
+          // and apply a brief CSS highlight pulse.
+
+          // First: dismiss any block currently in edit mode.
+          // Clicking the page title (or empty area) naturally exits
+          // any block editing in Roam — this is the most reliable
+          // way since API/React blur methods don't trigger the
+          // internal state transition.
+          if (document.activeElement?.tagName === "TEXTAREA") {
+            const title = document.querySelector(".rm-title-display, .roam-article .rm-title-display");
+            if (title) {
+              title.click();
+            } else {
+              // Fallback: click the article area
+              const article = document.querySelector(".roam-body-main .roam-article");
+              if (article) article.click();
+            }
+            // Brief wait for Roam to process the click and exit edit mode
+            await new Promise((r) => setTimeout(r, 50));
+          }
+
+          const selector = `.roam-block-container[data-block-uid="${uid}"]`;
+          let blockEl = null;
+
+          if (windowId === "main-window") {
+            const main = document.querySelector(".roam-body-main");
+            blockEl = main?.querySelector(selector);
+          } else {
+            const sidebar = document.getElementById("right-sidebar");
+            if (sidebar) blockEl = sidebar.querySelector(selector);
+          }
+
+          if (blockEl) {
+            blockEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
+            // Persistent highlight — cleared on next click anywhere
+            clearSelectHighlight();
+            blockEl.classList.add("agent-select-highlight");
+            const clearOnClick = () => {
+              clearSelectHighlight();
+              document.removeEventListener("click", clearOnClick, true);
+              document.removeEventListener("keydown", clearOnClick, true);
+            };
+            document.addEventListener("click", clearOnClick, true);
+            document.addEventListener("keydown", clearOnClick, true);
+          } else {
+            // Block not in DOM (scrolled out of virtual list) — fall back
+            // to API focus as best effort.
+            await window.roamAlphaAPI.ui.setBlockFocusAndSelection({
+              location: { "block-uid": uid, "window-id": windowId },
+            });
+          }
         }
-        // mode === "edit": nothing else needed, textarea is already focused
 
         await writeResponse(commandBlockUid, id, "done", {
           uid,

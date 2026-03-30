@@ -110,3 +110,10 @@
 .roam-block-container.agent-annotated:has(.agent-badge--warn) > .rm-block-main .rm-block__input {
   border-left-color: #f6b93b;
 }
+
+/* ── Select highlight (focus mode) ── */
+
+.agent-select-highlight {
+  background: rgb(213, 230, 243) !important;
+  border-radius: 4px;
+}
