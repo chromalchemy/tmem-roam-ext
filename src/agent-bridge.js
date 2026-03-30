@@ -237,6 +237,7 @@ function clearSelectHighlight() {
   document
     .querySelectorAll(".agent-select-highlight")
     .forEach((el) => el.classList.remove("agent-select-highlight"));
+  selectedBlockUids = [];
 }
 
 // ── Block Scanning (navigator-style) ─────────────────────────────────
@@ -309,6 +310,7 @@ function scanVisibleBlocks(scope = "all", includeText = true) {
 
 // Active label mapping, exported to state writer
 let activeLabelMap = {}; // {"A": {uid: "uid1", region: "main"}, ...}
+let selectedBlockUids = []; // UIDs of blocks highlighted via select-block focus mode
 
 function updateLabelMap(scannedBlocks) {
   activeLabelMap = {};
@@ -438,6 +440,10 @@ async function captureViewState() {
   const labelKeys = Object.keys(activeLabelMap);
   if (labelKeys.length > 0) {
     state.labels = activeLabelMap; // {"A": {uid, region}, ...}
+  }
+
+  if (selectedBlockUids.length > 0) {
+    state.selected = selectedBlockUids;
   }
 
   return state;
@@ -764,6 +770,7 @@ async function processCommand(commandBlockUid, cmd) {
 
           // Clear any previous selection highlight
           clearSelectHighlight();
+          selectedBlockUids = [...uids];
 
           const root =
             windowId === "main-window"
@@ -791,11 +798,16 @@ async function processCommand(commandBlockUid, cmd) {
           // Clear highlights on next user interaction
           const clearOnInteract = () => {
             clearSelectHighlight();
+            lastStateJson = null; // force state write to clear selected
             document.removeEventListener("click", clearOnInteract, true);
             document.removeEventListener("keydown", clearOnInteract, true);
           };
           document.addEventListener("click", clearOnInteract, true);
           document.addEventListener("keydown", clearOnInteract, true);
+
+          // Force immediate state write so selected uids are available
+          lastStateJson = null;
+          writeViewState();
         }
 
         await writeResponse(commandBlockUid, id, "done", {

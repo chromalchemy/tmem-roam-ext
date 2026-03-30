@@ -53,6 +53,11 @@
             {"location" {"parent-uid" parent-uid "order" "last"}
              "block"    {"string" text}}))
 
+(defn roam-move-block [graph uid parent-uid order]
+  (roam-api graph "data.block.move"
+            {"location" {"parent-uid" parent-uid "order" order}
+             "block"    {"uid" uid}}))
+
 ;; ── Bridge helpers ───────────────────────────────────────────────────
 
 (defn find-bridge-uids [graph]
@@ -251,6 +256,73 @@
                         (if (= wid "main-window") "" (str " [" wid "]"))))
           (println (str "   \"" text "\"")))))))
 
+(defn move-blocks!
+  "Move block(s) by label under a target parent block.
+   source-str: comma-separated labels of blocks to move (e.g. \"A,B,C\")
+   target-label: label of the target parent block"
+  [graph state source-str target-label]
+  (let [src-labels (map str/trim (str/split (str/upper-case source-str) #","))
+        tgt-label  (str/upper-case (str/trim target-label))
+        tgt-uid    (resolve-uid state tgt-label)
+        resolved   (keep (fn [lbl]
+                           (when-let [uid (resolve-uid state lbl)]
+                             {:label lbl :uid uid
+                              :text (or (get-block-string graph uid) "")}))
+                         src-labels)
+        missing    (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) src-labels)]
+
+    (when-not tgt-uid
+      (println (str "⚠️  Target label " tgt-label " not found."))
+      (when-let [labels (:labels state)]
+        (println (str "   Available: " (str/join ", " (sort (map name (keys labels)))))))
+      (System/exit 1))
+
+    (when (seq missing)
+      (println (str "⚠️  Source label(s) not found: " (str/join ", " missing))))
+
+    (when (seq resolved)
+      (let [tgt-text (or (get-block-string graph tgt-uid) "")]
+        (println (str "📦 Moving " (count resolved) " block(s) under "
+                      tgt-label " → " tgt-uid))
+        (println (str "   target: \"" tgt-text "\"")))
+      (doseq [{:keys [label uid text]} resolved]
+        (roam-move-block graph uid tgt-uid "last")
+        (println (str "   ✅ " label " → " uid " moved"))
+        (println (str "      \"" text "\""))))))
+
+(defn move-selected!
+  "Move the currently selected (highlighted) blocks to a target parent.
+   Reads selected UIDs from __state__.selected, moves them, then re-selects."
+  [graph commands-uid state target-label]
+  (let [selected (:selected state)
+        tgt-uid  (resolve-uid state (str/upper-case (str/trim target-label)))]
+
+    (when-not (seq selected)
+      (println "⚠️  No blocks currently selected. Use --select first.")
+      (System/exit 1))
+
+    (when-not tgt-uid
+      (println (str "⚠️  Target label " (str/upper-case target-label) " not found."))
+      (System/exit 1))
+
+    (let [tgt-text (or (get-block-string graph tgt-uid) "")]
+      (println (str "📦 Moving " (count selected) " selected block(s) under "
+                    (str/upper-case target-label) " → " tgt-uid))
+      (println (str "   target: \"" tgt-text "\"")))
+
+    (doseq [uid selected]
+      (let [text (or (get-block-string graph uid) "")]
+        (roam-move-block graph uid tgt-uid "last")
+        (println (str "   ✅ " uid " moved"))
+        (println (str "      \"" text "\""))))
+
+    ;; Re-select the moved blocks at their new location
+    (Thread/sleep 200) ;; let Roam process the moves
+    (send-command! graph commands-uid
+      (str "sel-" (System/currentTimeMillis)) "select-block"
+      {:uids (vec selected) :window_id "main-window" :mode "focus"})
+    (println (str "🎯 " (count selected) " block(s) re-selected"))))
+
 ;; ── Main ─────────────────────────────────────────────────────────────
 
 (def cli-spec
@@ -262,12 +334,15 @@
    :select  {:desc "Select (highlight) block by label character"}
    :e       {:desc "Edit mode: focus block text for typing" :coerce :boolean}
    :edit    {:desc "Edit mode: focus block text for typing" :coerce :boolean}
+   :move    {:desc "Move block(s) by label (comma-separated)"}
+   :move-selected {:desc "Move currently selected blocks" :coerce :boolean}
+   :to      {:desc "Target parent block label for --move/--move-selected"}
    :s       {:desc "Select in sidebar (optionally nth: -s 2)"}
    :sidebar {:desc "Select in sidebar (optionally nth: --sidebar 2)"}
    :scope   {:desc "Nav scope: main|sidebar|all" :default "all"}})
 
 (let [opts    (cli/parse-opts *command-line-args* {:spec cli-spec})
-      {:keys [graph on off labels label select scope]} opts
+      {:keys [graph on off labels label select scope move to]} opts
       ;; -s and --sidebar are aliases; -s takes priority
       ;; value can be: true (bare flag), or a number string
       sb-raw  (or (:s opts) (:sidebar opts))
@@ -293,6 +368,15 @@
     select (select-block! graph commands-uid
                           (ensure-labels! graph commands-uid state-uid scope) select
                           {:sidebar sb :edit edit?})
+    move   (if-not to
+             (println "⚠️  --move requires --to <label> for target parent")
+             (move-blocks! graph (ensure-labels! graph commands-uid state-uid scope)
+                           move to))
+    (:move-selected opts)
+           (if-not to
+             (println "⚠️  --move-selected requires --to <label> for target parent")
+             (move-selected! graph commands-uid
+                             (ensure-labels! graph commands-uid state-uid scope) to))
     label  (act-on-label! graph (ensure-labels! graph commands-uid state-uid scope) label)
     :else  (do (println "Usage:")
                (println "  bb bridge --on              # turn on nav labels")
@@ -303,4 +387,7 @@
                (println "  bb bridge --select A -e     # focus block A for editing")
                (println "  bb bridge --select A -s     # highlight block A in sidebar")
                (println "  bb bridge --select A -s -e  # edit block A in sidebar")
+               (println "  bb bridge --move A --to D   # move block A under block D")
+               (println "  bb bridge --move A,B --to D # move blocks A,B under block D")
+               (println "  bb bridge --move-selected --to D  # move selected blocks under D")
                (println "  bb bridge --label A         # act on block A"))))
