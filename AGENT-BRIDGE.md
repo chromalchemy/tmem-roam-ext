@@ -99,7 +99,7 @@ roam-agent/bridge               ← page (uid stored in bridgePageUid)
 │       └── {"id":"cmd-2","status":"done","result":{"value":"my-graph"}}
 │
 └── __state__                    ← extension writes current view state (on change, polled every 2s)
-    └── {"ts":…,"main":{…},"sidebar":[],"focused":null,"labels":{"A":"uid1","B":"uid2",…}}
+    └── {"ts":…,"main":{…},"sidebar":[],"focused":null,"labels":{"A":{"uid":"uid1","region":"main"},"B":{"uid":"uid2","region":"main"},…}}
 ```
 
 ## How To Tell It's Working
@@ -109,7 +109,8 @@ roam-agent/bridge               ← page (uid stored in bridgePageUid)
 | Console logs | Browser DevTools | `[agent-bridge] Loaded. Control page: roam-agent/bridge` |
 | Control page | Navigate to `roam-agent/bridge` in Roam | `__commands__` and `__state__` blocks exist |
 | State updates | `__state__` child block | `ts` field increments every ~2 seconds |
-| Command palette | Cmd+P → "Agent Bridge: Show Status" | Toast showing active/inactive + annotation count |
+| Command palette | Cmd+P → "Agent Bridge: Show Status" | Toast showing active/inactive, annotation count, and nav-mode state |
+| Command palette | Cmd+P → "Agent Bridge: Toggle Nav Mode" | Toggles nav-mode on/off with toast confirmation |
 | DOM elements | Inspect `<head>` | `<style id="agent-bridge-styles">` present |
 
 ## Local API Access
@@ -157,9 +158,14 @@ curl -X POST http://localhost:3333/api/graph/tmem \
 | API | Read state? | Write commands? | Bridge reacts? |
 |-----|-------------|-----------------|----------------|
 | Local API (`:3333`) | ✅ | ✅ | ✅ Immediate (PullWatch) |
-| Backend API (`api.roamresearch.com`) | ✅ | ✅ | ⚠️ After sync |
+| Backend API (`api.roamresearch.com`) | ✅ | ✅ | ⚠️ After sync¹ |
 | `roamAlphaAPI` (in-browser) | ✅ | ✅ | ✅ Immediate |
 | roam-mcp (MCP tools) | ✅ | ✅ | ✅ Immediate |
+
+¹ The Backend API writes are synced to the local Roam client on a delay
+(typically seconds to tens of seconds depending on sync conditions). The
+extension's PullWatch won't fire until the sync completes, making Backend
+API unsuitable for latency-sensitive command flows.
 
 ## Command Protocol
 
@@ -189,11 +195,28 @@ The external agent should delete processed command blocks when done to keep the
 control page clean. Commands accumulate under `__commands__` indefinitely —
 there is no automatic garbage collection.
 
+**Example: deleting a processed command via Local API**
+
+```bash
+# After reading the response from command block <cmd-block-uid>, delete it:
+curl -X POST http://localhost:3333/api/graph/tmem \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "delete-block",
+    "block": {"uid": "<cmd-block-uid>"}
+  }'
+```
+
+**Bulk cleanup:** To clear all commands at once, delete all children of the
+`__commands__` block. The extension will continue to function — the PullWatch
+and dedup set are unaffected by deletions.
+
 ### Deduplication
 
 Each command `id` is tracked in memory. Re-processing the same `id` is skipped.
-The dedup set is capped at 500 entries (oldest evicted first). If the extension
-is reloaded, the set resets — stale undeleted commands may re-fire.
+The dedup set is capped at 500 entries (oldest evicted first). On load, the
+extension pre-seeds the dedup set from all existing command blocks, preventing
+re-processing of old commands after a reload.
 
 ## Command Reference
 
@@ -230,6 +253,8 @@ to appear.
 
 **Response:** `{"count": 3}`
 
+> **Side-effect:** Also updates `activeLabelMap` and `__state__.labels` with the provided label→uid mapping.
+
 ### `clear`
 
 Remove all annotations from the DOM.
@@ -239,6 +264,8 @@ Remove all annotations from the DOM.
 ```
 
 **Response:** `{}`
+
+> **Side-effect:** Also clears the label map — `__state__.labels` will be absent on the next state write.
 
 ### `get-view`
 
@@ -255,7 +282,7 @@ Snapshot the current main window, sidebar, and focused block.
   "main": {"type": "outline", "uid": "page-uid"},
   "sidebar": [{"type": "outline", "block-uid": "...", "order": 0}],
   "focused": {"block-uid": "...", "window-id": "..."},
-  "labels": {"A": "uid1", "B": "uid2"}
+  "labels": {"A": {"uid": "uid1", "region": "main"}, "B": {"uid": "uid2", "region": "main"}}
 }
 ```
 
@@ -283,6 +310,15 @@ Z, AA, AB, …), render yellow hint badges, and return the full mapping.
 
 **`include_text`** (optional): Include each block's text content in the
 response. Default: `true`.
+
+**Response fields per entry:**
+- **`label`**: Assigned letter label (A, B, … Z, AA, AB, …)
+- **`uid`**: Block UID
+- **`region`**: `"main"` or `"sidebar"`
+- **`text`**: Block string content (present when `include_text` is true)
+- **`page`**: Page title from the block's `data-page-title` DOM attribute
+  (present when the block is rendered under a page header, e.g. on daily notes
+  or linked references — may be absent for blocks on their own page)
 
 **Response:**
 ```json
@@ -319,6 +355,91 @@ send: {"id":"s2","type":"scan-blocks","args":{"scope":"main"}}
 send: {"id":"s3","type":"clear","args":{}}
 ```
 
+### `nav-mode`
+
+Persistent auto-labelling mode. Scans visible blocks, assigns labels, renders
+yellow nav badges, and auto-rescans whenever the view changes (page navigation,
+sidebar open/close, blocks appearing/disappearing).
+
+```json
+{
+  "id": "cmd-007",
+  "type": "nav-mode",
+  "args": {"scope": "all"}
+}
+```
+
+**`scope`** (optional): `"main"`, `"sidebar"`, or `"all"`. Default: `"all"`.
+
+While active, the extension monitors a view fingerprint (current page, sidebar
+state, visible block UIDs) on every 2s poll. If the fingerprint changes, a full
+rescan is triggered automatically — labels are re-assigned and
+`__state__.labels` is updated. No manual re-scan needed.
+
+**Response:**
+```json
+{
+  "active": true,
+  "scope": "all",
+  "count": 12,
+  "labels": {"A": {"uid": "J3n66dJ3t", "region": "main"}, "B": {"uid": "_ddHPWaGg", "region": "main"}}
+}
+```
+
+Use `nav-off` to disable. Use `clear` to remove badges without disabling the
+mode (though nav-mode will re-render them on next rescan).
+
+### `nav-off`
+
+Turn off nav-mode auto-labelling. Clears all annotations and the label map.
+
+```json
+{"id": "cmd-008", "type": "nav-off", "args": {}}
+```
+
+**Response:** `{"active": false}`
+
+> **Side-effect:** Clears all annotations from the DOM and resets the label map — `__state__.labels` will be absent on the next state write (same effect as `clear`, plus disabling auto-rescan).
+
+### `select-block`
+
+Highlight or edit block(s) in the Roam UI. Accepts single or multiple UIDs.
+
+```json
+{
+  "id": "cmd-009",
+  "type": "select-block",
+  "args": {
+    "uids": ["J3n66dJ3t", "_ddHPWaGg"],
+    "window_id": "main-window",
+    "mode": "focus"
+  }
+}
+```
+
+**`uids`** (required): Array of block UIDs to select. Also accepts `uid`
+(string) for a single block.
+
+**`window_id`** (optional): `"main-window"` (default) or a sidebar window ID.
+Determines which pane to search for the block.
+
+**`mode`** (optional): `"focus"` (default) highlights the block(s) with a
+visual indicator without entering edit mode. `"edit"` focuses the first block's
+textarea for text input.
+
+In focus mode, highlighted blocks get an `agent-select-highlight` CSS class and
+are scrolled into view. The highlight clears on the next user click or keypress.
+The selected UIDs are written to `__state__.selected`.
+
+**Response:** `{"uids": ["J3n66dJ3t", "_ddHPWaGg"], "mode": "focus", "window_id": "main-window"}`
+
+The response echoes all requested UIDs regardless of whether they were found
+in the DOM. Blocks not currently rendered (scrolled out of Roam's virtual list)
+will be included in the response but won't receive a visual highlight.
+
+See `docs/BLOCK-SELECTION-LIMITATIONS.md` for known limitations of block
+selection.
+
 ### `eval`
 
 Run arbitrary JavaScript in the Roam browser context. Has access to
@@ -340,7 +461,15 @@ The `code` string becomes the body of `new Function("roamAlphaAPI", code)`, so:
 - Use `return` to pass values back
 - `roamAlphaAPI` is available as a local binding
 - `window`, `document`, etc. are all accessible
-- Async code works: `return await roamAlphaAPI.data.pull("...", ...)`
+- **Promises are awaited:** If your code returns a Promise, the bridge `await`s
+  it before writing the response. Example:
+  `return roamAlphaAPI.data.pull("[:block/string]", [":block/uid", "abc123"])`
+
+> **⚠️ Limitation:** Top-level `await` is **not supported** — `new Function()`
+> creates a synchronous function body, so `await` inside the code string will
+> throw a `SyntaxError`. Return a Promise instead and the bridge handles the
+> rest. If you need multiple async steps, wrap them:
+> `return (async () => { const a = await fetch(...); return a.json(); })()`
 
 **Error response:** `{"error": "ReferenceError: x is not defined", "stack": "..."}`
 
@@ -381,17 +510,26 @@ polls are skipped to avoid Datascript churn.
   "main": {"type": "outline", "uid": "03-27-2026", "title": "March 27th, 2026"},
   "sidebar": [],
   "focused": {"block-uid": "focused-uid", "window-id": "main-window"},
-  "labels": {"A": "J3n66dJ3t", "B": "_ddHPWaGg", "C": "miiKh8x3o"}
+  "labels": {"A": {"uid": "J3n66dJ3t", "region": "main"}, "B": {"uid": "_ddHPWaGg", "region": "main"}, "C": {"uid": "miiKh8x3o", "region": "main"}},
+  "selected": ["J3n66dJ3t"]
 }
 ```
 
-- **`labels`** — present when annotations are active (via `scan-blocks` or
-  `annotate`). Maps visual hint labels to block UIDs. Agents can resolve
-  "block B" → `_ddHPWaGg` by reading this field.
-- **`focused`** — `null` when no block is being edited.
-
 The external agent can poll this block to detect navigation and focus changes
 without needing to issue `get-view` commands.
+
+### State Schema
+
+Canonical reference for all fields in the `__state__` JSON object:
+
+| Field | Type | Presence | Description |
+|-------|------|----------|-------------|
+| `ts` | `number` | Always | Unix timestamp (ms) of when this state snapshot was captured |
+| `main` | `object` | Always | Current main window view. Contains `type` (`"outline"`, `"graph"`, etc.), `uid` (page UID), and `title` (page title) |
+| `sidebar` | `array` | Always | Array of sidebar window objects. Each has `type`, `block-uid`, `order`, and `window-id`. Empty array `[]` when sidebar is closed or empty |
+| `focused` | `object \| null` | Always | Currently focused (editing) block: `{"block-uid": "...", "window-id": "..."}`. `null` when no block is being edited |
+| `labels` | `object` | Conditional | Present when annotations are active (via `scan-blocks`, `annotate`, or `nav-mode`). Maps label strings to `{"uid": "...", "region": "main"|"sidebar"}`. Agents resolve "block B" → UID by reading `labels.B.uid`. Absent when no annotations are active |
+| `selected` | `string[]` | Conditional | Present when blocks are highlighted via `select-block` focus mode. Array of block UIDs. Clears automatically when the user clicks or presses a key |
 
 ## In-Memory State
 
@@ -405,8 +543,13 @@ without needing to issue `get-view` commands.
 | `pullWatchCallback` | Reference to the PullWatch listener (for cleanup) |
 | `stateInterval` | `setInterval` handle for the 2s view-state poll |
 | `lastStateJson` | Previous state snapshot for diff-before-write optimization |
-| `blockObserver` | `MutationObserver` on `.roam-body-main` for re-applying badges |
-| `activeLabelMap` | `{"A": "uid1", …}` — current label→uid mapping, included in state |
+| `blockObserver` | `MutationObserver` on `.roam-body-main` and `#right-sidebar` for re-applying badges |
+| `activeLabelMap` | `{"A": {"uid": "uid1", "region": "main"}, …}` — current label→uid mapping, included in state |
+| `navModeActive` | `boolean` — whether nav-mode auto-labelling is active |
+| `navModeScope` | `"main"` \| `"sidebar"` \| `"all"` — scope for nav-mode scanning |
+| `lastNavViewKey` | Fingerprint of last view state for nav-mode change detection |
+| `selectedBlockUids` | `string[]` — UIDs of blocks highlighted via `select-block` focus mode |
+| `renderingInProgress` | `boolean` — suppresses MutationObserver callbacks during own DOM writes |
 
 ## Example: MCP Agent Workflow
 
@@ -453,19 +596,96 @@ create_block(
 
 # Poll __state__ to detect navigation or resolve labels
 get_page(title="roam-agent/bridge")
-→ __state__ includes {"labels":{"A":"uid1","B":"uid2"}, ...}
+→ __state__ includes {"labels":{"A":{"uid":"uid1","region":"main"},"B":{"uid":"uid2","region":"main"}}, ...}
 ```
+
+## CLI Client (`bridge.bb`)
+
+A Babashka CLI client that communicates with the agent bridge via Roam's
+Local API. Provides command-line access to nav-mode, block selection, and
+block movement.
+
+### Usage
+
+```bash
+bb bridge --on                    # turn on nav-mode labels
+bb bridge --off                   # turn off nav-mode labels
+bb bridge --labels                # show label→uid map
+bb bridge --select A              # highlight block A
+bb bridge --select A,B,C          # highlight multiple blocks
+bb bridge --select A -e           # focus block A for editing
+bb bridge --select A -s           # highlight block A in sidebar
+bb bridge --select A -s -e        # edit block A in sidebar
+bb bridge --move A --to D         # move block A under block D
+bb bridge --move A,B --to D       # move blocks A,B under block D
+bb bridge --move-selected --to D  # move currently selected blocks under D
+bb bridge --label A               # ⚠️ deprecated — append timestamp to block A
+```
+
+### Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--graph` | Roam graph name | `tmem` |
+| `--on` | Turn on nav-mode (scan + label visible blocks) | |
+| `--off` | Turn off nav-mode | |
+| `--labels` | Print current label→uid mapping | |
+| `--select <label>` | Select/highlight block(s) by label (comma-separated) | |
+| `-e` / `--edit` | Edit mode: focus block text for typing | |
+| `--move <labels>` | Move block(s) by label (comma-separated) | |
+| `--move-selected` | Move currently selected (highlighted) blocks | |
+| `--to <label>` | Target parent block label for `--move` / `--move-selected` | |
+| `-s` / `--sidebar` | Select in sidebar (optionally Nth: `-s 2`) | |
+| `--scope` | Nav scope: `main` \| `sidebar` \| `all` | `all` |
+| `--label <X>` | **Deprecated.** Legacy action that appends a ✅ timestamp to a block. Use `--select <X>` instead for highlighting, or operate on blocks directly via the Local API | |
+
+### How it works
+
+The CLI discovers the bridge control page (`roam-agent/bridge`) via Datalog
+queries against the Local API. It sends commands by creating blocks under
+`__commands__` and polls for response children. Label resolution reads
+`__state__.labels` (auto-enabling nav-mode if labels aren't present).
+
+## Security Considerations
+
+The agent bridge intentionally exposes powerful browser-context capabilities
+to any process that can write blocks to the Roam graph. Understand the trust
+boundaries before deploying.
+
+**Trust model:** Any client with write access to the `roam-agent/bridge`
+page can execute arbitrary JavaScript in the user's browser session via the
+`eval` command. This includes full access to `roamAlphaAPI`, the DOM,
+`localStorage`, cookies, and any other browser APIs.
+
+**Attack surface:**
+
+| Vector | Risk | Mitigation |
+|--------|------|------------|
+| Local API (`:3333`) | Low — localhost only, requires graph token | Ensure token is not leaked; Local API binds to `127.0.0.1` |
+| Shared/multiplayer graph | **High** — any collaborator can write commands | Never use the bridge on shared graphs, or delete the control page when not in use |
+| Backend API | Medium — requires API token with write access | Treat API tokens as secrets; rotate if compromised |
+| `eval` command | **High** — arbitrary code execution by design | Restrict to trusted agents only; consider removing `eval` in production builds |
+
+**Recommendations:**
+- Only run the bridge extension on graphs you fully control
+- Do not share the `roam-agent/bridge` page with collaborators
+- Treat your Roam API token and Local API port as sensitive credentials
+- Delete the control page when the bridge is not actively in use
+- Audit any agent code that issues `eval` commands
 
 ## Known Issues
 
 | Severity | Issue | Notes |
 |----------|-------|-------|
 | 🟡 | No command garbage collection | Commands accumulate under `__commands__` forever; agent must clean up |
-| 🟡 | Dedup can produce duplicate responses | PullWatch can fire twice before the dedup set catches up |
+| 🟡 | Block selection is fragile | Focus-mode highlight uses DOM class manipulation; see `docs/BLOCK-SELECTION-LIMITATIONS.md` |
 | 🟢 | Fallback toasts don't stack | Multiple simultaneous `notify` commands overlap at the same position |
 | 🟢 | `scan-blocks` only sees rendered DOM | Collapsed children and blocks scrolled out of Roam's virtual list won't appear |
+| ✅ | ~~Dedup re-fires on reload~~ | Fixed: pre-seeds dedup set from existing commands on load |
 | ✅ | ~~State writes every 2s unconditionally~~ | Fixed: diff-before-write skips unchanged state |
 | ✅ | ~~Dead `navObserver` variable~~ | Fixed: removed |
+| ✅ | ~~Dead CLJS interop code~~ | Fixed: removed `resolveCljsSymbols` and `selectBlockViaInternals` |
+| ✅ | ~~Dead `navRescanTimer` reference~~ | Fixed: removed from `onunload` |
 
 ## Building
 
@@ -484,9 +704,11 @@ Output: `extension.js` (≈7KB minified)
 |------|---------|
 | `src/agent-bridge.js` | Extension source (onload/onunload) |
 | `src/agent-bridge.css` | Badge/overlay styles |
+| `bridge.bb` | Babashka CLI client for the agent bridge |
 | `webpack.config.js` | Webpack config (entry: `src/agent-bridge.js`) |
 | `extension.js` | Built output (loaded by Roam) |
-| `bb.edn` | Babashka tasks (serve, serve-https, build) |
+| `bb.edn` | Babashka tasks (serve, serve-https, build, bridge) |
 | `serve_https.bb` | HTTPS server script (http-kit + socat TLS) |
+| `docs/BLOCK-SELECTION-LIMITATIONS.md` | Known limitations of CLJS-based block selection |
 | `.certs/` | Local TLS certificates (gitignored) |
 | `AGENT-BRIDGE.md` | This file |
