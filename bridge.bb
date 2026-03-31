@@ -22,11 +22,21 @@
 (def default-graph "tmem")
 (def api-base "http://localhost:3333/api")
 
-(defn load-token [graph]
-  (let [path (str (fs/home) "/.roam-tools.json")]
-    (when (fs/exists? path)
-      (-> (slurp path) (json/parse-string true) :graphs
-          (->> (filter #(= (:name %) graph)) first :token)))))
+(def load-token
+  "Read API token from ~/.roam-tools.json. Memoized per graph."
+  (memoize
+    (fn [graph]
+      (let [path (str (fs/home) "/.roam-tools.json")]
+        (when (fs/exists? path)
+          (-> (slurp path) (json/parse-string true) :graphs
+              (->> (filter #(= (:name %) graph)) first :token)))))))
+
+(defn esc-dq
+  "Escape a string for safe interpolation into Datalog query strings."
+  [s]
+  (-> (str s)
+      (str/replace "\\" "\\\\")
+      (str/replace "\"" "\\\"")))
 
 ;; ── Roam Local API ───────────────────────────────────────────────────
 
@@ -78,7 +88,7 @@
   (when-let [s (ffirst
                  (roam-q graph
                    (str "[:find ?s :where
-                          [?p :block/uid \"" state-uid "\"]
+                          [?p :block/uid \"" (esc-dq state-uid) "\"]
                           [?p :block/children ?c]
                           [?c :block/string ?s]]")))]
     (json/parse-string s true)))
@@ -90,10 +100,13 @@
     (when (>= i 60)
       (throw (ex-info "Bridge timeout" {:cmd-id cmd-id})))
     (Thread/sleep 50)
+    ;; Scoped query: only search children of the commands block
     (let [rows (roam-q graph
                  (str "[:find ?s :where
+                        [?p :block/uid \"" (esc-dq commands-uid) "\"]
+                        [?p :block/children ?cmd]
                         [?cmd :block/string ?cs]
-                        [(clojure.string/includes? ?cs \"" cmd-id "\")]
+                        [(clojure.string/includes? ?cs \"" (esc-dq cmd-id) "\")]
                         [?cmd :block/children ?r]
                         [?r :block/string ?s]]"))
           resp (->> rows
@@ -101,7 +114,13 @@
                                         (catch Exception _ nil))))
                     (filter #(= (:id %) cmd-id))
                     first)]
-      (or resp (recur (inc i))))))
+      (if resp
+        (do
+          (when (= (:status resp) "error")
+            (throw (ex-info (str "Bridge error: " (get-in resp [:result :error]))
+                            {:cmd-id cmd-id :resp resp})))
+          resp)
+        (recur (inc i))))))
 
 ;; ── Actions ──────────────────────────────────────────────────────────
 
@@ -118,14 +137,6 @@
     (str "navoff-" (System/currentTimeMillis)) "nav-off" {})
   (println "❌ Nav mode OFF"))
 
-(defn label-uid [labels label-kw]
-  (let [v (get labels label-kw)]
-    (if (map? v) (:uid v) v)))
-
-(defn label-region [labels label-kw]
-  (let [v (get labels label-kw)]
-    (if (map? v) (:region v) "main")))
-
 (defn print-labels [state]
   (if-let [labels (:labels state)]
     (do
@@ -139,15 +150,18 @@
 
 (defn get-block-string [graph uid]
   (ffirst (roam-q graph
-            (str "[:find ?s :where [?b :block/uid \"" uid "\"] [?b :block/string ?s]]"))))
+            (str "[:find ?s :where [?b :block/uid \"" (esc-dq uid) "\"] [?b :block/string ?s]]"))))
+
+(defn resolve-uid [state label]
+  (let [v (get (:labels state) (keyword (str/upper-case label)))]
+    (if (map? v) (:uid v) v)))
 
 (defn act-on-label! [graph state label]
-  (let [labels (:labels state)
-        uid    (get labels (keyword (str/upper-case label)))]
+  (let [uid (resolve-uid state label)]
     (if-not uid
       (do (println (str "⚠️  Label " (str/upper-case label) " not found."))
-          (when labels
-            (println (str "   Available: " (str/join ", " (sort (map name (keys labels))))))))
+          (when-let [lbls (:labels state)]
+            (println (str "   Available: " (str/join ", " (sort (map name (keys lbls))))))))
       (let [text (or (get-block-string graph uid) "")
             ts   (.format (java.time.LocalTime/now)
                    (java.time.format.DateTimeFormatter/ofPattern "HH:mm:ss"))
@@ -165,10 +179,6 @@
       ;; nav-on! response includes labels — use directly, no re-read needed
       (let [result (nav-on! graph commands-uid scope)]
         {:labels (:labels result)}))))
-
-(defn resolve-uid [state label]
-  (let [v (get (:labels state) (keyword (str/upper-case label)))]
-    (if (map? v) (:uid v) v)))
 
 (defn extract-window-uid
   "Extract the page/block uid from a sidebar window-id string.
@@ -199,7 +209,7 @@
                                           (roam-q graph
                                             (str "[:find ?pu :where
                                                    [?p :block/children ?b]
-                                                   [?b :block/uid \"" cur "\"]
+                                                   [?b :block/uid \"" (esc-dq cur) "\"]
                                                    [?p :block/uid ?pu]]")))]
                              (cond
                                (nil? parent) nil
@@ -215,18 +225,18 @@
    :edit    - if truthy, focus block text for editing (cursor in textarea)
               otherwise, highlight/select the block(s) without entering edit mode"
   [graph commands-uid state label-str {:keys [sidebar edit]}]
-  (let [labels (map str/trim (str/split (str/upper-case label-str) #","))
+  (let [label-keys (map str/trim (str/split (str/upper-case label-str) #","))
         resolved (keep (fn [lbl]
                          (when-let [uid (resolve-uid state lbl)]
                            {:label lbl :uid uid
                             :text (or (get-block-string graph uid) "")}))
-                       labels)
-        missing  (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) labels)]
+                       label-keys)
+        missing  (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) label-keys)]
 
     (when (seq missing)
       (println (str "⚠️  Label(s) not found: " (str/join ", " missing)))
-      (when-let [labels (:labels state)]
-        (println (str "   Available: " (str/join ", " (sort (map name (keys labels))))))))
+      (when-let [lbls (:labels state)]
+        (println (str "   Available: " (str/join ", " (sort (map name (keys lbls))))))))
 
     (when (seq resolved)
       (let [uids (mapv :uid resolved)
@@ -271,10 +281,9 @@
         missing    (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) src-labels)]
 
     (when-not tgt-uid
-      (println (str "⚠️  Target label " tgt-label " not found."))
-      (when-let [labels (:labels state)]
-        (println (str "   Available: " (str/join ", " (sort (map name (keys labels)))))))
-      (System/exit 1))
+      (throw (ex-info (str "Target label " tgt-label " not found")
+                      {:available (when-let [lbls (:labels state)]
+                                    (sort (map name (keys lbls))))})))
 
     (when (seq missing)
       (println (str "⚠️  Source label(s) not found: " (str/join ", " missing))))
@@ -297,12 +306,10 @@
         tgt-uid  (resolve-uid state (str/upper-case (str/trim target-label)))]
 
     (when-not (seq selected)
-      (println "⚠️  No blocks currently selected. Use --select first.")
-      (System/exit 1))
+      (throw (ex-info "No blocks currently selected. Use --select first." {})))
 
     (when-not tgt-uid
-      (println (str "⚠️  Target label " (str/upper-case target-label) " not found."))
-      (System/exit 1))
+      (throw (ex-info (str "Target label " (str/upper-case target-label) " not found") {})))
 
     (let [tgt-text (or (get-block-string graph tgt-uid) "")]
       (println (str "📦 Moving " (count selected) " selected block(s) under "
@@ -360,33 +367,39 @@
     (println "❌ Bridge not loaded.")
     (System/exit 1))
 
-  (cond
-    on     (nav-on! graph commands-uid scope)
-    off    (nav-off! graph commands-uid)
-    labels (print-labels (ensure-labels! graph commands-uid state-uid scope))
-    select (select-block! graph commands-uid
-                          (ensure-labels! graph commands-uid state-uid scope) select
-                          {:sidebar sb :edit edit?})
-    move   (if-not to
-             (println "⚠️  --move requires --to <label> for target parent")
-             (move-blocks! graph (ensure-labels! graph commands-uid state-uid scope)
-                           move to))
-    (:move-selected opts)
-           (if-not to
-             (println "⚠️  --move-selected requires --to <label> for target parent")
-             (move-selected! graph commands-uid
-                             (ensure-labels! graph commands-uid state-uid scope) to))
-    label  (act-on-label! graph (ensure-labels! graph commands-uid state-uid scope) label)
-    :else  (do (println "Usage:")
-               (println "  bb bridge --on              # turn on nav labels")
-               (println "  bb bridge --off             # turn off nav labels")
-               (println "  bb bridge --labels          # show label→uid map")
-               (println "  bb bridge --select A        # highlight block A")
-               (println "  bb bridge --select A,B,C    # highlight multiple blocks")
-               (println "  bb bridge --select A -e     # focus block A for editing")
-               (println "  bb bridge --select A -s     # highlight block A in sidebar")
-               (println "  bb bridge --select A -s -e  # edit block A in sidebar")
-               (println "  bb bridge --move A --to D   # move block A under block D")
-               (println "  bb bridge --move A,B --to D # move blocks A,B under block D")
-               (println "  bb bridge --move-selected --to D  # move selected blocks under D")
-               (println "  bb bridge --label A         # act on block A"))))
+  (try
+    (cond
+      on     (nav-on! graph commands-uid scope)
+      off    (nav-off! graph commands-uid)
+      labels (print-labels (ensure-labels! graph commands-uid state-uid scope))
+      select (select-block! graph commands-uid
+                            (ensure-labels! graph commands-uid state-uid scope) select
+                            {:sidebar sb :edit edit?})
+      move   (if-not to
+               (println "⚠️  --move requires --to <label> for target parent")
+               (move-blocks! graph (ensure-labels! graph commands-uid state-uid scope)
+                             move to))
+      (:move-selected opts)
+             (if-not to
+               (println "⚠️  --move-selected requires --to <label> for target parent")
+               (move-selected! graph commands-uid
+                               (ensure-labels! graph commands-uid state-uid scope) to))
+      label  (act-on-label! graph (ensure-labels! graph commands-uid state-uid scope) label)
+      :else  (do (println "Usage:")
+                 (println "  bb bridge --on              # turn on nav labels")
+                 (println "  bb bridge --off             # turn off nav labels")
+                 (println "  bb bridge --labels          # show label→uid map")
+                 (println "  bb bridge --select A        # highlight block A")
+                 (println "  bb bridge --select A,B,C    # highlight multiple blocks")
+                 (println "  bb bridge --select A -e     # focus block A for editing")
+                 (println "  bb bridge --select A -s     # highlight block A in sidebar")
+                 (println "  bb bridge --select A -s -e  # edit block A in sidebar")
+                 (println "  bb bridge --move A --to D   # move block A under block D")
+                 (println "  bb bridge --move A,B --to D # move blocks A,B under block D")
+                 (println "  bb bridge --move-selected --to D  # move selected blocks under D")
+                 (println "  bb bridge --label A         # act on block A")))
+    (catch clojure.lang.ExceptionInfo e
+      (println (str "⚠️  " (ex-message e)))
+      (when-let [avail (:available (ex-data e))]
+        (println (str "   Available: " (str/join ", " avail))))
+      (System/exit 1))))

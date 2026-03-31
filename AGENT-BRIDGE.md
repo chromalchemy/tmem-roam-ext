@@ -457,19 +457,15 @@ Run arbitrary JavaScript in the Roam browser context. Has access to
 
 **Response:** `{"value": "my-graph"}`
 
-The `code` string becomes the body of `new Function("roamAlphaAPI", code)`, so:
+The `code` string becomes the body of an `AsyncFunction("roamAlphaAPI", code)`,
+so:
 - Use `return` to pass values back
+- Top-level `await` is supported:
+  `return await roamAlphaAPI.data.pull("[:block/string]", [":block/uid", "abc123"])`
 - `roamAlphaAPI` is available as a local binding
 - `window`, `document`, etc. are all accessible
-- **Promises are awaited:** If your code returns a Promise, the bridge `await`s
-  it before writing the response. Example:
-  `return roamAlphaAPI.data.pull("[:block/string]", [":block/uid", "abc123"])`
-
-> **⚠️ Limitation:** Top-level `await` is **not supported** — `new Function()`
-> creates a synchronous function body, so `await` inside the code string will
-> throw a `SyntaxError`. Return a Promise instead and the bridge handles the
-> rest. If you need multiple async steps, wrap them:
-> `return (async () => { const a = await fetch(...); return a.json(); })()`
+- Multiple async steps work naturally:
+  `const a = await fetch(...); return await a.json()`
 
 **Error response:** `{"error": "ReferenceError: x is not defined", "stack": "..."}`
 

@@ -59,8 +59,14 @@ let processedCommandIds = new Set();
 let navModeActive = false;
 let navModeScope = "all";
 let renderingInProgress = false; // suppress observer during our own DOM writes
+let activeClearOnInteract = null; // tracked for cleanup on unload
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/** Escape a string for safe interpolation into Datalog query strings. */
+function escDq(s) {
+  return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
 
 function generateUID() {
   return window.roamAlphaAPI.util.generateUID();
@@ -82,7 +88,7 @@ function indexToLabel(i) {
 
 function getPageUid(title) {
   const result = window.roamAlphaAPI.q(
-    `[:find ?uid :where [?e :node/title "${title}"] [?e :block/uid ?uid]]`
+    `[:find ?uid :where [?e :node/title "${escDq(title)}"] [?e :block/uid ?uid]]`
   );
   return result?.[0]?.[0] || null;
 }
@@ -90,11 +96,11 @@ function getPageUid(title) {
 function getChildByString(parentUid, str) {
   const result = window.roamAlphaAPI.q(
     `[:find ?uid ?s :where
-      [?p :block/uid "${parentUid}"]
+      [?p :block/uid "${escDq(parentUid)}"]
       [?p :block/children ?c]
       [?c :block/uid ?uid]
       [?c :block/string ?s]
-      [(clojure.string/starts-with? ?s "${str}")]
+      [(clojure.string/starts-with? ?s "${escDq(str)}")]
     ]`
   );
   return result?.[0]?.[0] || null;
@@ -103,7 +109,7 @@ function getChildByString(parentUid, str) {
 function getChildren(parentUid) {
   const result = window.roamAlphaAPI.q(
     `[:find ?uid ?s ?order :where
-      [?p :block/uid "${parentUid}"]
+      [?p :block/uid "${escDq(parentUid)}"]
       [?p :block/children ?c]
       [?c :block/uid ?uid]
       [?c :block/string ?s]
@@ -326,8 +332,9 @@ function clearLabelMap() {
 // ── Nav Mode (auto-rescan) ───────────────────────────────────────────
 
 /**
- * Run a full rescan: scan visible blocks, render badges, update label map,
- * and force a state write so __state__.labels is fresh.
+ * Run a full rescan: scan visible blocks, render badges, update label map.
+ * Invalidates lastStateJson so the next poll cycle writes fresh state.
+ * Does NOT call writeViewState directly to avoid recursion.
  */
 function navRescan() {
   const scanned = scanVisibleBlocks(navModeScope, true);
@@ -338,9 +345,8 @@ function navRescan() {
   }));
   renderAnnotations(annotationBlocks);
   updateLabelMap(scanned);
-  // Force state write so labels are immediately available via Local API
+  // Invalidate cached state so next poll writes fresh labels
   lastStateJson = null;
-  writeViewState();
 }
 
 // Track the last view fingerprint so we only rescan on actual changes
@@ -391,24 +397,33 @@ function stopNavMode() {
   lastNavViewKey = null;
   clearAllAnnotations();
   clearLabelMap();
+  // Invalidate so next poll writes state without labels
   lastStateJson = null;
-  writeViewState();
   console.log("[agent-bridge] Nav mode OFF");
 }
 
 // Re-attach badges when Roam re-renders blocks (virtual list recycling).
 // Never triggers a rescan — only re-applies existing annotations.
+let applyPending = false;
 function startBlockObserver() {
   blockObserver = new MutationObserver(() => {
-    if (renderingInProgress) return;
+    if (renderingInProgress || applyPending) return;
     if (currentAnnotations.length > 0) {
-      requestAnimationFrame(applyAnnotationsToDOM);
+      applyPending = true;
+      requestAnimationFrame(() => {
+        applyAnnotationsToDOM();
+        applyPending = false;
+      });
     }
   });
 
   // Observe both main and sidebar for block re-renders
-  const main = document.querySelector(".roam-body-main") || document.body;
-  blockObserver.observe(main, { childList: true, subtree: true });
+  const main = document.querySelector(".roam-body-main");
+  if (main) {
+    blockObserver.observe(main, { childList: true, subtree: true });
+  } else {
+    console.warn("[agent-bridge] .roam-body-main not found, observer not attached");
+  }
 
   const sidebar = document.getElementById("right-sidebar");
   if (sidebar) {
@@ -450,33 +465,24 @@ async function captureViewState() {
 }
 
 let lastStateJson = null; // track previous write to avoid churn
+let stateWriteInProgress = false; // reentrancy guard
 
 async function writeViewState() {
-  if (!stateBlockUid) return;
+  if (!stateBlockUid || stateWriteInProgress) return;
+  stateWriteInProgress = true;
   try {
-    const state = await captureViewState();
-    const json = JSON.stringify(state);
-
-    // In nav-mode, check if view changed → rescan
+    // In nav-mode, check if view changed → rescan (synchronous, no recursion)
     if (navModeActive) {
-      const vfp = viewFingerprint(state);
+      const preState = await captureViewState();
+      const vfp = viewFingerprint(preState);
       if (vfp !== lastNavViewKey) {
         lastNavViewKey = vfp;
-        navRescan();
-        // Re-capture state after rescan so labels are fresh
-        const updated = await captureViewState();
-        const updatedJson = JSON.stringify(updated);
-        const updatedComparable = JSON.stringify({ ...updated, ts: 0 });
-        lastStateJson = updatedComparable;
-        const children = getChildren(stateBlockUid);
-        if (children.length > 0) {
-          await window.roamAlphaAPI.data.block.update({
-            block: { uid: children[0].uid, string: updatedJson },
-          });
-        }
-        return;
+        navRescan(); // updates annotations + labels, invalidates lastStateJson
       }
     }
+
+    const state = await captureViewState();
+    const json = JSON.stringify(state);
 
     // Skip write if nothing changed (ignore ts field for comparison)
     const comparable = JSON.stringify({ ...state, ts: 0 });
@@ -503,6 +509,8 @@ async function writeViewState() {
     }
   } catch (e) {
     console.error("[agent-bridge] writeViewState error:", e);
+  } finally {
+    stateWriteInProgress = false;
   }
 }
 
@@ -519,6 +527,17 @@ function stopStatePolling() {
 
 // ── Command Processing ───────────────────────────────────────────────
 
+// Serial command queue — prevents interleaving of concurrent async commands
+let commandQueue = Promise.resolve();
+
+function enqueueCommand(commandBlockUid, cmd) {
+  commandQueue = commandQueue
+    .then(() => processCommand(commandBlockUid, cmd))
+    .catch((e) =>
+      console.error(`[agent-bridge] Unhandled in command ${cmd.id}:`, e)
+    );
+}
+
 async function writeResponse(commandBlockUid, id, status, result) {
   const response = JSON.stringify({ id, status, result: result ?? null });
   await window.roamAlphaAPI.data.block.create({
@@ -533,10 +552,11 @@ async function processCommand(commandBlockUid, cmd) {
   if (processedCommandIds.has(id)) return;
   processedCommandIds.add(id);
 
-  // Cap the processed set to prevent unbounded growth
+  // Cap the processed set to prevent unbounded growth.
+  // Tight eviction (500→400) to reduce replay risk for uncleaned commands.
   if (processedCommandIds.size > 500) {
     const arr = [...processedCommandIds];
-    processedCommandIds = new Set(arr.slice(-250));
+    processedCommandIds = new Set(arr.slice(-400));
   }
 
   try {
@@ -648,13 +668,21 @@ async function processCommand(commandBlockUid, cmd) {
             });
           }
 
+          // Remove any previous interaction listener before adding new one
+          if (activeClearOnInteract) {
+            document.removeEventListener("click", activeClearOnInteract, true);
+            document.removeEventListener("keydown", activeClearOnInteract, true);
+          }
+
           // Clear highlights on next user interaction
           const clearOnInteract = () => {
             clearSelectHighlight();
             lastStateJson = null; // force state write to clear selected
             document.removeEventListener("click", clearOnInteract, true);
             document.removeEventListener("keydown", clearOnInteract, true);
+            activeClearOnInteract = null;
           };
+          activeClearOnInteract = clearOnInteract;
           document.addEventListener("click", clearOnInteract, true);
           document.addEventListener("keydown", clearOnInteract, true);
 
@@ -709,9 +737,11 @@ async function processCommand(commandBlockUid, cmd) {
           break;
         }
         try {
-          // Use Function constructor to avoid direct eval CSP issues
-          // The function has access to roamAlphaAPI via window
-          const fn = new Function("roamAlphaAPI", code);
+          // AsyncFunction supports top-level await in code strings
+          const AsyncFunction = Object.getPrototypeOf(
+            async function () {}
+          ).constructor;
+          const fn = new AsyncFunction("roamAlphaAPI", code);
           const evalResult = await fn(window.roamAlphaAPI);
           await writeResponse(commandBlockUid, id, "done", {
             value:
@@ -731,11 +761,13 @@ async function processCommand(commandBlockUid, cmd) {
       case "notify": {
         const message = args?.message || "Agent notification";
         const intent = args?.intent || "info"; // info, warning, error, success
-        // Roam's blueprint toast
-        const toastEl = document.querySelector(".bp3-toast-container");
-        if (toastEl && window.blueprintjs?.core?.Toaster) {
-          // If blueprint is available
-          window.blueprintjs.core.Toaster.create({}).show({
+        // Roam's blueprint toast (cached instance to avoid React root leak)
+        if (window.blueprintjs?.core?.Toaster) {
+          if (!window._agentBridgeToaster) {
+            window._agentBridgeToaster =
+              window.blueprintjs.core.Toaster.create({});
+          }
+          window._agentBridgeToaster.show({
             message,
             intent,
             timeout: 4000,
@@ -829,7 +861,7 @@ function startCommandWatch() {
       try {
         const cmd = JSON.parse(str);
         if (cmd.id && cmd.type) {
-          processCommand(uid, cmd);
+          enqueueCommand(uid, cmd);
         }
       } catch (_) {
         // Not JSON — ignore (could be the heading text itself or a response)
@@ -881,12 +913,12 @@ export async function onload({ extensionAPI }) {
 
   extensionAPI.ui.commandPalette.addCommand({
     label: "Agent Bridge: Toggle Nav Mode",
-    callback: () => {
+    callback: async () => {
       if (navModeActive) {
         stopNavMode();
         showFallbackToast("Nav mode OFF", "info");
       } else {
-        startNavMode("all");
+        await startNavMode("all");
         showFallbackToast(`Nav mode ON — ${Object.keys(activeLabelMap).length} blocks labelled`, "success");
       }
     },
@@ -906,6 +938,13 @@ export function onunload() {
   clearLabelMap();
   removeStyles();
   processedCommandIds.clear();
+
+  // Clean up tracked interaction listeners
+  if (activeClearOnInteract) {
+    document.removeEventListener("click", activeClearOnInteract, true);
+    document.removeEventListener("keydown", activeClearOnInteract, true);
+    activeClearOnInteract = null;
+  }
 
   bridgePageUid = null;
   commandsBlockUid = null;
