@@ -7,7 +7,7 @@ view-state subscriptions, and more.
 ## Why
 
 The Roam Local API (port 3333) gives external tools CRUD + navigation, but **cannot**:
-- Inject visual elements into the DOM (badges, overlays, highlights)
+- Inject visual elements into the DOM (overlays, highlights, bullet labels)
 - Subscribe to real-time view/focus changes
 - Run arbitrary JS or call browser-only APIs
 - Show toasts or notifications
@@ -222,7 +222,7 @@ re-processing of old commands after a reload.
 
 ### `annotate`
 
-Render index badges on blocks visible in the DOM.
+Render index labels on block bullets visible in the DOM.
 
 ```json
 {
@@ -243,12 +243,17 @@ Render index badges on blocks visible in the DOM.
 
 Calling `annotate` again **replaces** all existing annotations.
 
-Badges are positioned absolute in the left gutter of each block container.
-A `MutationObserver` on `.roam-body-main` re-applies them after Roam's
+Labels are rendered by setting `data-agent-label` and `data-agent-intent`
+attributes on the native bullet element (`.rm-bullet__inner` or
+`.rm-bullet__inner--user-icon`). CSS transforms the bullet into a labeled
+indicator. All native bullet behavior is preserved — click to zoom, drag to
+move, and right-click for the context menu all work normally.
+
+A `MutationObserver` on `.roam-body-main` re-applies labels after Roam's
 virtual-list re-renders.
 
 Blocks are matched via `data-block-uid` attribute on `.roam-block-container`
-elements. Blocks must be visible in the DOM (scrolled into view) for badges
+elements. Blocks must be visible in the DOM (scrolled into view) for labels
 to appear.
 
 **Response:** `{"count": 3}`
@@ -292,7 +297,7 @@ or `annotate`). It maps visual hint labels to block UIDs.
 ### `scan-blocks`
 
 Scan the DOM for all visible blocks, assign navigator-style labels (A, B, …
-Z, AA, AB, …), render yellow hint badges, and return the full mapping.
+Z, AA, AB, …), render yellow hint labels on the native bullets, and return the full mapping.
 
 ```json
 {
@@ -335,8 +340,9 @@ response. Default: `true`.
 The label→uid mapping is also written to `__state__.labels` so any agent
 polling state can resolve labels without re-issuing the command.
 
-Badges use the `nav` intent (yellow, compact, Vimium-style). Calling
-`scan-blocks` again re-scans and replaces all labels. Use `clear` to remove.
+Labels use the `nav` intent (yellow, compact, Vimium-style) rendered
+directly on the block bullets. Calling `scan-blocks` again re-scans and
+replaces all labels. Use `clear` to remove.
 
 **Typical agent workflow:**
 ```
@@ -358,7 +364,7 @@ send: {"id":"s3","type":"clear","args":{}}
 ### `nav-mode`
 
 Persistent auto-labelling mode. Scans visible blocks, assigns labels, renders
-yellow nav badges, and auto-rescans whenever the view changes (page navigation,
+yellow nav labels on bullets, and auto-rescans whenever the view changes (page navigation,
 sidebar open/close, blocks appearing/disappearing).
 
 ```json
@@ -386,7 +392,7 @@ rescan is triggered automatically — labels are re-assigned and
 }
 ```
 
-Use `nav-off` to disable. Use `clear` to remove badges without disabling the
+Use `nav-off` to disable. Use `clear` to remove labels without disabling the
 mode (though nav-mode will re-render them on next rescan).
 
 ### `nav-off`
@@ -534,12 +540,12 @@ Canonical reference for all fields in the `__state__` JSON object:
 | `bridgePageUid` | UID of the `roam-agent/bridge` page |
 | `commandsBlockUid` | UID of the `__commands__` block |
 | `stateBlockUid` | UID of the `__state__` block |
-| `currentAnnotations` | Array of `{uid, label, intent}` for active badge overlays |
+| `currentAnnotations` | Array of `{uid, label, intent}` for active bullet label overlays |
 | `processedCommandIds` | `Set<string>` dedup guard, capped at 500 entries |
 | `pullWatchCallback` | Reference to the PullWatch listener (for cleanup) |
 | `stateInterval` | `setInterval` handle for the 2s view-state poll |
 | `lastStateJson` | Previous state snapshot for diff-before-write optimization |
-| `blockObserver` | `MutationObserver` on `.roam-body-main` and `#right-sidebar` for re-applying badges |
+| `blockObserver` | `MutationObserver` on `.roam-body-main` and `#right-sidebar` for re-applying bullet labels |
 | `activeLabelMap` | `{"A": {"uid": "uid1", "region": "main"}, …}` — current label→uid mapping, included in state |
 | `navModeActive` | `boolean` — whether nav-mode auto-labelling is active |
 | `navModeScope` | `"main"` \| `"sidebar"` \| `"all"` — scope for nav-mode scanning |
@@ -559,7 +565,7 @@ create_block(
   markdown='{"id":"s1","type":"scan-blocks","args":{"scope":"main"}}'
 )
 → response: {"count":8,"mapping":[{"label":"A","uid":"J3n66dJ3t","text":"ray salamy"}, ...]}
-→ yellow A–H badges appear on blocks in Roam
+→ yellow A–H labels appear on block bullets in Roam
 
 # 2. User says "edit block C"
 # Agent resolves C → miiKh8x3o from the mapping (or from __state__.labels)
@@ -699,7 +705,7 @@ Output: `extension.js` (≈7KB minified)
 | File | Purpose |
 |------|---------|
 | `src/agent-bridge.js` | Extension source (onload/onunload) |
-| `src/agent-bridge.css` | Badge/overlay styles |
+| `src/agent-bridge.css` | Bullet-label and overlay styles |
 | `bridge.bb` | Babashka CLI client for the agent bridge |
 | `webpack.config.js` | Webpack config (entry: `src/agent-bridge.js`) |
 | `extension.js` | Built output (loaded by Roam) |

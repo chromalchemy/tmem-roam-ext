@@ -1,114 +1,105 @@
-/* ── Agent Bridge: Block Annotation Badges ── */
+/* ── Agent Bridge: Bullet-as-Label Annotations ──
+ *
+ * Instead of injecting badge divs, we set data-agent-label and
+ * data-agent-intent attributes on the bullet's inner element
+ * (.rm-bullet__inner or .rm-bullet__inner--user-icon).
+ * CSS transforms the native bullet into a labeled indicator.
+ * All native behavior (click-to-zoom, drag, right-click menu) is preserved.
+ */
 
-.agent-badge {
-  position: absolute;
-  left: 2px;
-  top: 2px;
-  width: 20px;
-  height: 20px;
-  border-radius: 4px;
-  background: #4a69bd;
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  font-family: "SF Mono", "Fira Code", "Consolas", monospace;
-  line-height: 20px;
-  text-align: center;
-  pointer-events: none;
-  z-index: 10;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
-  user-select: none;
-  opacity: 0;
-  animation: agent-badge-in 0.15s ease-out forwards;
+/* ── Base label style (shared by all intents) ── */
+
+/* Add spacing between the bullet column and block text */
+.rm-bullet:has([data-agent-label]) {
+  margin-right: 15px !important;
 }
 
-@keyframes agent-badge-in {
+.rm-bullet__inner[data-agent-label],
+.rm-bullet__inner--user-icon[data-agent-label] {
+  /* Replace the dot with a labeled shape */
+  background: #4a69bd !important;
+  border-radius: 3px !important;
+  width: auto !important;
+  min-width: 14px !important;
+  height: 14px !important;
+  padding: 0 2px !important;
+
+  /* Reset dot-specific styles */
+  border: none !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(0, 0, 0, 0.06) !important;
+
+  /* Layout for the pseudo-element text */
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+
+  /* Vertically align with the first line of block text */
+  position: relative !important;
+  top: -4px !important;
+
+  /* Hide the user-icon color ring */
+  --rm-edited-email-color: transparent !important;
+
+  /* Entry animation */
+  animation: agent-bullet-in 0.15s ease-out both;
+}
+
+@keyframes agent-bullet-in {
   from {
-    opacity: 0;
-    transform: scale(0.7) translateX(-4px);
+    opacity: 0.3;
+    transform: scale(0.7);
   }
   to {
     opacity: 1;
-    transform: scale(1) translateX(0);
+    transform: scale(1);
   }
 }
 
-/* Ensure the block container is positioned for the absolute badge */
-.roam-block-container.agent-annotated {
-  position: relative;
-}
-
-/* Subtle highlight on the annotated block's content area */
-.roam-block-container.agent-annotated > .rm-block-main .rm-block__input {
-  border-left: 2px solid #4a69bd;
-  padding-left: 4px;
-  border-radius: 2px;
-}
-
-/* Different badge colours by intent */
-.agent-badge--action {
-  background: #e55039;
-}
-
-.agent-badge--info {
-  background: #4a69bd;
-}
-
-.agent-badge--success {
-  background: #27ae60;
-}
-
-.agent-badge--warn {
-  background: #f6b93b;
-  color: #333;
-}
-
-/* ── Navigator-style hint badges (scan-blocks) ── */
-
-.agent-badge--nav {
-  background: rgba(255, 204, 0, 0.92);
-  color: #1a1a1a;
-  font-size: 10px;
+/* The label text, rendered via pseudo-element */
+.rm-bullet__inner[data-agent-label]::after,
+.rm-bullet__inner--user-icon[data-agent-label]::after {
+  content: attr(data-agent-label);
+  font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+  font-size: 9px;
   font-weight: 800;
-  line-height: 16px;
-  width: auto;
-  min-width: 16px;
-  height: 16px;
-  padding: 0 3px;
-  border-radius: 3px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(0, 0, 0, 0.08);
-  letter-spacing: 0.5px;
-  left: 2px;
-  top: 3px;
+  line-height: 1;
+  letter-spacing: 0.3px;
+  color: #fff;
+  pointer-events: none;
 }
 
-/* Sidebar badges: can't overflow left — float before block content */
-#right-sidebar .agent-badge {
-  position: absolute;
-  left: 2px;
-  top: 2px;
-  width: auto;
-  min-width: 16px;
-  max-width: 24px;
+/* ── Intent colours ── */
+
+/* nav (white, clean — default for scan-blocks / nav-mode) */
+[data-agent-intent="nav"][data-agent-label] {
+  background: #fff !important;
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(0, 0, 0, 0.12) !important;
+}
+[data-agent-intent="nav"][data-agent-label]::after {
+  color: #1a1a1a;
 }
 
-/* Lighter left-border for nav annotations */
-.roam-block-container.agent-annotated > .rm-block-main .rm-block__input {
-  border-left-color: rgba(255, 204, 0, 0.6);
+/* info (blue — default for annotate) */
+[data-agent-intent="info"][data-agent-label] {
+  background: #4a69bd !important;
 }
 
-/* Override left-border colour when using non-nav intents */
-.roam-block-container.agent-annotated:has(.agent-badge--info) > .rm-block-main .rm-block__input {
-  border-left-color: #4a69bd;
+/* action (red) */
+[data-agent-intent="action"][data-agent-label] {
+  background: #e55039 !important;
 }
-.roam-block-container.agent-annotated:has(.agent-badge--action) > .rm-block-main .rm-block__input {
-  border-left-color: #e55039;
+
+/* success (green) */
+[data-agent-intent="success"][data-agent-label] {
+  background: #27ae60 !important;
 }
-.roam-block-container.agent-annotated:has(.agent-badge--success) > .rm-block-main .rm-block__input {
-  border-left-color: #27ae60;
+
+/* warn (yellow with dark text) */
+[data-agent-intent="warn"][data-agent-label] {
+  background: #f6b93b !important;
 }
-.roam-block-container.agent-annotated:has(.agent-badge--warn) > .rm-block-main .rm-block__input {
-  border-left-color: #f6b93b;
+[data-agent-intent="warn"][data-agent-label]::after {
+  color: #333;
 }
 
 /* ── Select highlight (focus mode) ── */

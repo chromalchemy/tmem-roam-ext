@@ -4,7 +4,7 @@
  * Bridges an external MCP agent (via Roam Local API) to the in-browser
  * roamAlphaAPI surface. Provides:
  *
- *   1. Block annotation overlays (visual index badges)
+ *   1. Block annotation overlays (labels on native bullets)
  *   2. Proactive view-state reporting
  *   3. Arbitrary JS eval
  *   4. Toast notifications
@@ -41,8 +41,9 @@ import badgeCSS from "./agent-bridge.css";
 const BRIDGE_PAGE = "roam-agent/bridge";
 const COMMANDS_HEADING = "__commands__";
 const STATE_HEADING = "__state__";
-const BADGE_CLASS = "agent-badge";
 const ANNOTATED_CLASS = "agent-annotated";
+// Selector for the bullet's inner element (both plain and user-icon variants)
+const BULLET_INNER_SEL = ".rm-bullet__inner, .rm-bullet__inner--user-icon";
 const POLL_INTERVAL_MS = 2000; // view-state reporting cadence
 
 // ── State ────────────────────────────────────────────────────────────
@@ -164,13 +165,26 @@ function removeStyles() {
 }
 
 // ── Annotation Rendering ─────────────────────────────────────────────
+//
+// Labels are rendered by setting data-agent-label and data-agent-intent
+// attributes on the bullet's inner element (.rm-bullet__inner or
+// .rm-bullet__inner--user-icon). CSS transforms the bullet into a
+// labeled indicator. No extra DOM elements are created.
+// Native bullet behavior (click-to-zoom, drag, right-click) is preserved.
 
 function clearAllAnnotations() {
   renderingInProgress = true;
-  document.querySelectorAll(`.${BADGE_CLASS}`).forEach((el) => el.remove());
+  // Remove label attributes from all labeled bullets
+  document.querySelectorAll("[data-agent-label]").forEach((el) => {
+    el.removeAttribute("data-agent-label");
+    el.removeAttribute("data-agent-intent");
+  });
   document
     .querySelectorAll(`.${ANNOTATED_CLASS}`)
-    .forEach((el) => el.classList.remove(ANNOTATED_CLASS));
+    .forEach((el) => {
+      el.classList.remove(ANNOTATED_CLASS);
+      el.removeAttribute("data-agent-intent");
+    });
   currentAnnotations = [];
   renderingInProgress = false;
 }
@@ -180,39 +194,47 @@ function renderAnnotations(blocks) {
   const newBlocks = blocks || [];
   const newUids = new Set(newBlocks.map((b) => b.uid));
 
-  // Remove badges for blocks no longer in the new set
-  document.querySelectorAll(`.${BADGE_CLASS}`).forEach((el) => {
-    if (!newUids.has(el.dataset.agentUid)) {
-      const container = el.closest(`.${ANNOTATED_CLASS}`);
-      el.remove();
-      if (container && !container.querySelector(`.${BADGE_CLASS}`)) {
-        container.classList.remove(ANNOTATED_CLASS);
-      }
-    }
-  });
-
-  // Update labels on existing badges if they changed
-  const existingByUid = {};
-  document.querySelectorAll(`.${BADGE_CLASS}`).forEach((el) => {
-    const uid = el.dataset.agentUid;
-    if (!existingByUid[uid]) existingByUid[uid] = [];
-    existingByUid[uid].push(el);
-  });
-
-  for (const { uid, label, intent } of newBlocks) {
-    const existing = existingByUid[uid];
-    if (existing) {
-      // Update label text if changed
-      for (const el of existing) {
-        if (el.textContent !== label) el.textContent = label;
-        const cls = `${BADGE_CLASS} ${BADGE_CLASS}--${intent || "info"}`;
-        if (el.className !== cls) el.className = cls;
-      }
-    }
+  // Build a lookup of new block annotations by uid
+  const newByUid = {};
+  for (const b of newBlocks) {
+    newByUid[b.uid] = b;
   }
 
+  // Remove labels from blocks no longer in the new set
+  document.querySelectorAll(`.${ANNOTATED_CLASS}`).forEach((container) => {
+    const uid = container.getAttribute("data-block-uid");
+    if (!uid || !newUids.has(uid)) {
+      container.classList.remove(ANNOTATED_CLASS);
+      container.removeAttribute("data-agent-intent");
+      const bullet = container.querySelector(BULLET_INNER_SEL);
+      if (bullet) {
+        bullet.removeAttribute("data-agent-label");
+        bullet.removeAttribute("data-agent-intent");
+      }
+    }
+  });
+
+  // Update existing labeled bullets if label/intent changed
+  document.querySelectorAll("[data-agent-label]").forEach((bullet) => {
+    const container = bullet.closest(".roam-block-container");
+    const uid = container?.getAttribute("data-block-uid");
+    if (uid && newByUid[uid]) {
+      const { label, intent } = newByUid[uid];
+      if (bullet.dataset.agentLabel !== label) {
+        bullet.dataset.agentLabel = label;
+      }
+      const intentVal = intent || "info";
+      if (bullet.dataset.agentIntent !== intentVal) {
+        bullet.dataset.agentIntent = intentVal;
+      }
+      if (container.dataset.agentIntent !== intentVal) {
+        container.dataset.agentIntent = intentVal;
+      }
+    }
+  });
+
   currentAnnotations = newBlocks;
-  // Add badges for new blocks not yet in the DOM
+  // Apply labels to blocks not yet labeled in the DOM
   applyAnnotationsToDOM();
   renderingInProgress = false;
 }
@@ -224,16 +246,17 @@ function applyAnnotationsToDOM() {
       `.roam-block-container[data-block-uid="${uid}"]`
     );
     for (const blockEl of blockEls) {
-      if (blockEl.querySelector(`.${BADGE_CLASS}`)) continue; // already rendered
+      // Find the bullet inner element
+      const bullet = blockEl.querySelector(`:scope > .rm-block-main ${BULLET_INNER_SEL}`);
+      if (!bullet || bullet.hasAttribute("data-agent-label")) continue; // already labeled
 
+      // Set label and intent as data attributes — CSS does the rest
+      bullet.dataset.agentLabel = label;
+      bullet.dataset.agentIntent = intent || "info";
+
+      // Mark the container for left-border styling
       blockEl.classList.add(ANNOTATED_CLASS);
-
-      const badge = document.createElement("div");
-      badge.className = `${BADGE_CLASS} ${BADGE_CLASS}--${intent || "info"}`;
-      badge.textContent = label;
-      badge.dataset.agentUid = uid;
-
-      blockEl.insertBefore(badge, blockEl.firstChild);
+      blockEl.dataset.agentIntent = intent || "info";
     }
   }
   renderingInProgress = false;
@@ -280,7 +303,7 @@ function scanVisibleBlocks(scope = "all", includeText = true) {
       if (!uid) continue;
 
       // Deduplicate: if this uid was already labelled (e.g. same block in
-      // main + sidebar), skip — it gets the same badge via applyAnnotationsToDOM
+      // main + sidebar), skip — it gets labeled via applyAnnotationsToDOM
       if (seenUids.has(uid)) continue;
       seenUids.add(uid);
 
@@ -332,7 +355,7 @@ function clearLabelMap() {
 // ── Nav Mode (auto-rescan) ───────────────────────────────────────────
 
 /**
- * Run a full rescan: scan visible blocks, render badges, update label map.
+ * Run a full rescan: scan visible blocks, label bullets, update label map.
  * Invalidates lastStateJson so the next poll cycle writes fresh state.
  * Does NOT call writeViewState directly to avoid recursion.
  */
@@ -402,7 +425,7 @@ function stopNavMode() {
   console.log("[agent-bridge] Nav mode OFF");
 }
 
-// Re-attach badges when Roam re-renders blocks (virtual list recycling).
+// Re-apply bullet labels when Roam re-renders blocks (virtual list recycling).
 // Never triggers a rescan — only re-applies existing annotations.
 let applyPending = false;
 function startBlockObserver() {
@@ -704,7 +727,7 @@ async function processCommand(commandBlockUid, cmd) {
         const includeText = args?.include_text !== false; // default true
         const scanned = scanVisibleBlocks(scope, includeText);
 
-        // Render navigator-style badges on all scanned blocks
+        // Label all scanned blocks with navigator-style labels
         const annotationBlocks = scanned.map(({ uid, label }) => ({
           uid,
           label,
