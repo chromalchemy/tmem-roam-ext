@@ -1,44 +1,58 @@
 /* ── Agent Bridge: Bullet-as-Label Annotations ──
  *
- * Instead of injecting badge divs, we set data-agent-label and
- * data-agent-intent attributes on the bullet's inner element
- * (.rm-bullet__inner or .rm-bullet__inner--user-icon).
- * CSS transforms the native bullet into a labeled indicator.
- * All native behavior (click-to-zoom, drag, right-click menu) is preserved.
+ * Labels are rendered on .rm-bullet[draggable] via ::before, positioned
+ * to the RIGHT of the bullet with position:absolute. This keeps the
+ * fold/unfold caret clear on the left, places the label close to text,
+ * and preserves drag/click/menu on .rm-bullet.
  */
 
-/* ── Base label style (shared by all intents) ── */
+/* ── Parent bullet: labeled state ── */
 
-/* Add spacing between the bullet column and block text */
-.rm-bullet:has([data-agent-label]) {
-  margin-right: 15px !important;
+.rm-bullet[data-agent-label] {
+  position: relative !important;
+  cursor: pointer !important;
+  /* Extra right margin creates space for the label between bullet and text */
+  margin-right: 25px !important;
 }
 
-.rm-bullet__inner[data-agent-label],
-.rm-bullet__inner--user-icon[data-agent-label] {
-  /* Replace the dot with a labeled shape */
-  background: #4a69bd !important;
-  border-radius: 3px !important;
-  width: auto !important;
-  min-width: 14px !important;
-  height: 14px !important;
-  padding: 0 2px !important;
+/* Hide the inner dot while labeled */
+.rm-bullet[data-agent-label] .rm-bullet__inner,
+.rm-bullet[data-agent-label] .rm-bullet__inner--user-icon {
+  visibility: hidden !important;
+  width: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
 
-  /* Reset dot-specific styles */
-  border: none !important;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(0, 0, 0, 0.06) !important;
+/* ── The label: positioned to the right of the bullet ── */
 
-  /* Layout for the pseudo-element text */
-  display: inline-flex !important;
-  align-items: center !important;
-  justify-content: center !important;
+.rm-bullet[data-agent-label]::before {
+  content: attr(data-agent-label);
+  font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  text-align: center;
+  color: #fff;
 
-  /* Vertically align with the first line of block text */
-  position: relative !important;
-  top: -4px !important;
+  /* Shape */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 2px;
+  border-radius: 3px;
+  background: #4a69bd;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(0, 0, 0, 0.06);
 
-  /* Hide the user-icon color ring */
-  --rm-edited-email-color: transparent !important;
+  /* Position: right of bullet, vertically centered with first text line.
+     top: 50% aligns with bullet center; +3px nudges down to text center. */
+  position: absolute;
+  left: 100%;
+  top: calc(50% - 2px);
+  transform: translateY(-50%);
+  margin-left: 2px;
 
   /* Entry animation */
   animation: agent-bullet-in 0.15s ease-out both;
@@ -47,80 +61,52 @@
 @keyframes agent-bullet-in {
   from {
     opacity: 0.3;
-    transform: scale(0.7);
+    transform: translateY(-50%) scale(0.7);
   }
   to {
     opacity: 1;
-    transform: scale(1);
+    transform: translateY(-50%) scale(1);
   }
-}
-
-/* The label text, rendered via pseudo-element */
-.rm-bullet__inner[data-agent-label]::after,
-.rm-bullet__inner--user-icon[data-agent-label]::after {
-  content: attr(data-agent-label);
-  font-family: "SF Mono", "Fira Code", "Consolas", monospace;
-  font-size: 9px;
-  font-weight: 800;
-  line-height: 1;
-  letter-spacing: 0.3px;
-  color: #fff;
-  pointer-events: none;
 }
 
 /* ── Intent colours ── */
 
 /* nav (white, clean — default for scan-blocks / nav-mode) */
-[data-agent-intent="nav"][data-agent-label] {
-  background: #fff !important;
-  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(0, 0, 0, 0.12) !important;
-}
-[data-agent-intent="nav"][data-agent-label]::after {
+.rm-bullet[data-agent-intent="nav"]::before {
+  background: #fbfbfb;
   color: #1a1a1a;
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(0, 0, 0, 0.12);
 }
 
 /* info (blue — default for annotate) */
-[data-agent-intent="info"][data-agent-label] {
-  background: #4a69bd !important;
+.rm-bullet[data-agent-intent="info"]::before {
+  background: #4a69bd;
+  color: #fff;
 }
 
 /* action (red) */
-[data-agent-intent="action"][data-agent-label] {
-  background: #e55039 !important;
+.rm-bullet[data-agent-intent="action"]::before {
+  background: #e55039;
+  color: #fff;
 }
 
 /* success (green) */
-[data-agent-intent="success"][data-agent-label] {
-  background: #27ae60 !important;
+.rm-bullet[data-agent-intent="success"]::before {
+  background: #27ae60;
+  color: #fff;
 }
 
 /* warn (yellow with dark text) */
-[data-agent-intent="warn"][data-agent-label] {
-  background: #f6b93b !important;
-}
-[data-agent-intent="warn"][data-agent-label]::after {
+.rm-bullet[data-agent-intent="warn"]::before {
+  background: #f6b93b;
   color: #333;
 }
 
-/* ── Folded/children indicators ──
- *
- * Roam adds .rm-bullet--closed on the bullet and .rm-block--closed on the
- * container when a block with children is collapsed. We use this to visually
- * distinguish folded blocks from leaf blocks.
- *
- *   Leaf (no children):     white bg, light border (default)
- *   Open with children:     white bg, darker border
- *   Folded with children:   filled bg, white text — signals hidden content
- */
+/* ── Folded with children: light gray fill ── */
 
-/* Open with children: slightly bolder outline */
-.rm-block--open:not(.rm-block--closed) > .rm-block-main .rm-bullet:has([data-agent-label]) [data-agent-intent="nav"][data-agent-label] {
-  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.25), 0 0 0 1.5px rgba(0, 0, 0, 0.2) !important;
-}
-
-/* Folded with children: light gray fill to signal hidden content */
-.rm-bullet--closed [data-agent-label] {
+.rm-bullet--closed[data-agent-label]::before {
   background: #e8e8e8 !important;
+  color: #1a1a1a !important;
 }
 
 /* ── Select highlight (focus mode) ── */

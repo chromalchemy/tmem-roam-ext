@@ -43,8 +43,8 @@ const BRIDGE_PAGE = "roam-agent/bridge";
 const COMMANDS_HEADING = "__commands__";
 const STATE_HEADING = "__state__";
 const ANNOTATED_CLASS = "agent-annotated";
-// Selector for the bullet's inner element (both plain and user-icon variants)
-const BULLET_INNER_SEL = ".rm-bullet__inner, .rm-bullet__inner--user-icon";
+// Selector for the draggable bullet span (parent of the inner dot)
+const BULLET_SEL = ".rm-bullet";
 const POLL_INTERVAL_MS = 2000; // view-state reporting cadence
 
 // ── State ────────────────────────────────────────────────────────────
@@ -168,10 +168,10 @@ function removeStyles() {
 // ── Annotation Rendering ─────────────────────────────────────────────
 //
 // Labels are rendered by setting data-agent-label and data-agent-intent
-// attributes on the bullet's inner element (.rm-bullet__inner or
-// .rm-bullet__inner--user-icon). CSS transforms the bullet into a
-// labeled indicator. No extra DOM elements are created.
-// Native bullet behavior (click-to-zoom, drag, right-click) is preserved.
+// attributes on .rm-bullet (the draggable span). CSS uses ::before to
+// render the label text and hides the inner dot. Since the label is part
+// of the draggable element itself, all pointer events (drag, click, menu)
+// work naturally.
 
 function clearAllAnnotations() {
   renderingInProgress = true;
@@ -207,7 +207,7 @@ function renderAnnotations(blocks) {
     if (!uid || !newUids.has(uid)) {
       container.classList.remove(ANNOTATED_CLASS);
       container.removeAttribute("data-agent-intent");
-      const bullet = container.querySelector(BULLET_INNER_SEL);
+      const bullet = container.querySelector(BULLET_SEL);
       if (bullet) {
         bullet.removeAttribute("data-agent-label");
         bullet.removeAttribute("data-agent-intent");
@@ -248,7 +248,7 @@ function applyAnnotationsToDOM() {
     );
     for (const blockEl of blockEls) {
       // Find the bullet inner element
-      const bullet = blockEl.querySelector(`:scope > .rm-block-main ${BULLET_INNER_SEL}`);
+      const bullet = blockEl.querySelector(`:scope > .rm-block-main ${BULLET_SEL}`);
       if (!bullet || bullet.hasAttribute("data-agent-label")) continue; // already labeled
 
       // Set label and intent as data attributes — CSS does the rest
