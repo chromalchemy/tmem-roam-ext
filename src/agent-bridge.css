@@ -102,6 +102,27 @@
   color: #333;
 }
 
+/* ── Folded/children indicators ──
+ *
+ * Roam adds .rm-bullet--closed on the bullet and .rm-block--closed on the
+ * container when a block with children is collapsed. We use this to visually
+ * distinguish folded blocks from leaf blocks.
+ *
+ *   Leaf (no children):     white bg, light border (default)
+ *   Open with children:     white bg, darker border
+ *   Folded with children:   filled bg, white text — signals hidden content
+ */
+
+/* Open with children: slightly bolder outline */
+.rm-block--open:not(.rm-block--closed) > .rm-block-main .rm-bullet:has([data-agent-label]) [data-agent-intent="nav"][data-agent-label] {
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.25), 0 0 0 1.5px rgba(0, 0, 0, 0.2) !important;
+}
+
+/* Folded with children: light gray fill to signal hidden content */
+.rm-bullet--closed [data-agent-label] {
+  background: #e8e8e8 !important;
+}
+
 /* ── Select highlight (focus mode) ── */
 
 .agent-select-highlight {

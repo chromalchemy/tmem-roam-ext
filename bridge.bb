@@ -58,6 +58,9 @@
 (defn roam-update-block [graph uid text]
   (roam-api graph "data.block.update" {"block" {"uid" uid "string" text}}))
 
+(defn roam-set-block-open [graph uid open?]
+  (roam-api graph "data.block.update" {"block" {"uid" uid "open" open?}}))
+
 (defn roam-create-block [graph parent-uid text]
   (roam-api graph "data.block.create"
             {"location" {"parent-uid" parent-uid "order" "last"}
@@ -67,6 +70,23 @@
   (roam-api graph "data.block.move"
             {"location" {"parent-uid" parent-uid "order" order}
              "block"    {"uid" uid}}))
+
+(defn get-page-uid [graph title]
+  (ffirst (roam-q graph
+            (str "[:find ?uid :where [?p :node/title \"" (esc-dq title) "\"] [?p :block/uid ?uid]]"))))
+
+(defn get-parent-uid [graph uid]
+  (ffirst (roam-q graph
+            (str "[:find ?pu :where
+                   [?p :block/children ?b]
+                   [?b :block/uid \"" (esc-dq uid) "\"]
+                   [?p :block/uid ?pu]]"))))
+
+(defn get-block-order [graph uid]
+  (ffirst (roam-q graph
+            (str "[:find ?order :where
+                   [?b :block/uid \"" (esc-dq uid) "\"]
+                   [?b :block/order ?order]]"))))
 
 ;; ── Bridge helpers ───────────────────────────────────────────────────
 
@@ -267,12 +287,30 @@
 
 (defn move-blocks!
   "Move block(s) by label under a target parent block.
-   source-str: comma-separated labels of blocks to move (e.g. \"A,B,C\")
-   target-label: label of the target parent block"
-  [graph state source-str target-label]
+   source-str: comma-separated labels of blocks to move
+   target: {:label \"D\"}, {:uid \"abc123\"}, {:page \"Title\"},
+           {:before \"B\"}, or {:after \"B\"}
+   order: \"first\" or \"last\" (default \"last\", ignored for before/after)"
+  [graph state source-str target order]
   (let [src-labels (map str/trim (str/split (str/upper-case source-str) #","))
-        tgt-label  (str/upper-case (str/trim target-label))
-        tgt-uid    (resolve-uid state tgt-label)
+        ;; For --before/--after, resolve the anchor block to find parent + order
+        anchor-label (or (:before target) (:after target))
+        anchor-uid   (when anchor-label (resolve-uid state anchor-label))
+        anchor-parent (when anchor-uid (get-parent-uid graph anchor-uid))
+        anchor-order  (when anchor-uid (get-block-order graph anchor-uid))
+        ;; Resolve target UID: for before/after use the anchor's parent
+        tgt-uid    (or (:uid target)
+                       (when (:label target) (resolve-uid state (:label target)))
+                       (when (:page target) (get-page-uid graph (:page target)))
+                       anchor-parent)
+        tgt-name   (or (:label target) (:page target) (:uid target)
+                       (when (:before target) (str "before " (:before target)))
+                       (when (:after target) (str "after " (:after target))))
+        ;; For before/after, compute numeric order; otherwise use first/last
+        order      (cond
+                     (:before target) anchor-order
+                     (:after target)  (when anchor-order (inc anchor-order))
+                     :else            (or order "last"))
         resolved   (keep (fn [lbl]
                            (when-let [uid (resolve-uid state lbl)]
                              {:label lbl :uid uid
@@ -280,8 +318,14 @@
                          src-labels)
         missing    (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) src-labels)]
 
+    ;; Validate anchor exists for before/after
+    (when (and anchor-label (not anchor-uid))
+      (throw (ex-info (str "Anchor label " anchor-label " not found")
+                      {:available (when-let [lbls (:labels state)]
+                                    (sort (map name (keys lbls))))})))
+
     (when-not tgt-uid
-      (throw (ex-info (str "Target label " tgt-label " not found")
+      (throw (ex-info (str "Target " tgt-name " not found")
                       {:available (when-let [lbls (:labels state)]
                                     (sort (map name (keys lbls))))})))
 
@@ -290,35 +334,40 @@
 
     (when (seq resolved)
       (let [tgt-text (or (get-block-string graph tgt-uid) "")]
-        (println (str "📦 Moving " (count resolved) " block(s) under "
-                      tgt-label " → " tgt-uid))
+        (println (str "📦 Moving " (count resolved) " block(s) " tgt-name))
         (println (str "   target: \"" tgt-text "\"")))
       (doseq [{:keys [label uid text]} resolved]
-        (roam-move-block graph uid tgt-uid "last")
+        (roam-move-block graph uid tgt-uid order)
         (println (str "   ✅ " label " → " uid " moved"))
         (println (str "      \"" text "\""))))))
 
 (defn move-selected!
   "Move the currently selected (highlighted) blocks to a target parent.
-   Reads selected UIDs from __state__.selected, moves them, then re-selects."
-  [graph commands-uid state target-label]
+   Reads selected UIDs from __state__.selected, moves them, then re-selects.
+   target: {:label \"D\"} or {:uid \"abc123\"}
+   order: \"first\" or \"last\" (default \"last\")"
+  [graph commands-uid state target order]
   (let [selected (:selected state)
-        tgt-uid  (resolve-uid state (str/upper-case (str/trim target-label)))]
+        tgt-uid  (or (:uid target)
+                     (when (:label target) (resolve-uid state (:label target)))
+                     (when (:page target) (get-page-uid graph (:page target))))
+        tgt-name (or (:label target) (:page target) (:uid target))
+        order    (or order "last")]
 
     (when-not (seq selected)
       (throw (ex-info "No blocks currently selected. Use --select first." {})))
 
     (when-not tgt-uid
-      (throw (ex-info (str "Target label " (str/upper-case target-label) " not found") {})))
+      (throw (ex-info (str "Target " tgt-name " not found") {})))
 
     (let [tgt-text (or (get-block-string graph tgt-uid) "")]
       (println (str "📦 Moving " (count selected) " selected block(s) under "
-                    (str/upper-case target-label) " → " tgt-uid))
+                    tgt-name " → " tgt-uid " (" order ")"))
       (println (str "   target: \"" tgt-text "\"")))
 
     (doseq [uid selected]
       (let [text (or (get-block-string graph uid) "")]
-        (roam-move-block graph uid tgt-uid "last")
+        (roam-move-block graph uid tgt-uid order)
         (println (str "   ✅ " uid " moved"))
         (println (str "      \"" text "\""))))
 
@@ -328,6 +377,109 @@
       (str "sel-" (System/currentTimeMillis)) "select-block"
       {:uids (vec selected) :window_id "main-window" :mode "focus"})
     (println (str "🎯 " (count selected) " block(s) re-selected"))))
+
+(defn delete-blocks!
+  "Delete block(s) by label. Accepts comma-separated labels.
+   Sends delete-blocks command to the bridge extension."
+  [graph commands-uid state label-str]
+  (let [label-keys (map str/trim (str/split (str/upper-case label-str) #","))
+        resolved   (keep (fn [lbl]
+                           (when-let [uid (resolve-uid state lbl)]
+                             {:label lbl :uid uid
+                              :text (or (get-block-string graph uid) "")}))
+                         label-keys)
+        missing    (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) label-keys)]
+
+    (when (seq missing)
+      (println (str "⚠️  Label(s) not found: " (str/join ", " missing)))
+      (when-let [lbls (:labels state)]
+        (println (str "   Available: " (str/join ", " (sort (map name (keys lbls))))))))
+
+    (when (seq resolved)
+      (let [labels-to-delete (mapv :label resolved)
+            resp (send-command! graph commands-uid
+                   (str "del-" (System/currentTimeMillis)) "delete-blocks"
+                   {:labels labels-to-delete})]
+        (doseq [{:keys [label uid text]} resolved]
+          (println (str "   🗑️  " label " → " uid " deleted"))
+          (println (str "      \"" text "\"")))
+        (println (str "✅ " (get-in resp [:result :count]) " block(s) deleted"))))))
+
+(defn reorder!
+  "Move block(s) to first or last child of their current parent.
+   label-str: comma-separated labels
+   order: \"first\" or \"last\""
+  [graph state label-str order]
+  (let [label-keys (map str/trim (str/split (str/upper-case label-str) #","))
+        order      (or order "last")
+        resolved   (keep (fn [lbl]
+                           (when-let [uid (resolve-uid state lbl)]
+                             {:label lbl :uid uid
+                              :text (or (get-block-string graph uid) "")}))
+                         label-keys)
+        missing    (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) label-keys)]
+
+    (when (seq missing)
+      (println (str "⚠️  Label(s) not found: " (str/join ", " missing))))
+
+    (doseq [{:keys [label uid text]} resolved]
+      (let [parent (get-parent-uid graph uid)]
+        (when-not parent
+          (throw (ex-info (str "Cannot find parent of block " label " (" uid ")") {})))
+        (roam-move-block graph uid parent order)
+        (println (str "   ✅ " label " → " uid " moved to " order))
+        (println (str "      \"" text "\""))))))
+
+(defn zoom!
+  "Zoom into a block by label (open it as the main view)."
+  [graph state label]
+  (let [uid (resolve-uid state (str/trim label))]
+    (when-not uid
+      (throw (ex-info (str "Label " (str/upper-case label) " not found")
+                      {:available (when-let [lbls (:labels state)]
+                                    (sort (map name (keys lbls))))})))
+    (let [text (or (get-block-string graph uid) "")]
+      (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}})
+      (println (str "🔎 " (str/upper-case label) " → " uid " zoomed"))
+      (println (str "   \"" text "\"")))))
+
+(defn zoom-parent!
+  "Zoom into the parent of a block by label."
+  [graph state label]
+  (let [uid (resolve-uid state (str/trim label))]
+    (when-not uid
+      (throw (ex-info (str "Label " (str/upper-case label) " not found")
+                      {:available (when-let [lbls (:labels state)]
+                                    (sort (map name (keys lbls))))})))
+    (let [parent (get-parent-uid graph uid)]
+      (when-not parent
+        (throw (ex-info (str "Block " (str/upper-case label) " has no parent") {})))
+      (let [text (or (get-block-string graph parent) "")]
+        (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" parent}})
+        (println (str "🔎 parent of " (str/upper-case label) " → " parent " zoomed"))
+        (println (str "   \"" text "\""))))))
+
+(defn fold!
+  "Fold (collapse) or unfold (expand) block(s) by label.
+   label-str: comma-separated labels
+   open?: false to fold, true to unfold"
+  [graph state label-str open?]
+  (let [label-keys (map str/trim (str/split (str/upper-case label-str) #","))
+        resolved   (keep (fn [lbl]
+                           (when-let [uid (resolve-uid state lbl)]
+                             {:label lbl :uid uid
+                              :text (or (get-block-string graph uid) "")}))
+                         label-keys)
+        missing    (remove (fn [lbl] (some #(= lbl (:label %)) resolved)) label-keys)
+        verb       (if open? "unfolded" "folded")]
+
+    (when (seq missing)
+      (println (str "⚠️  Label(s) not found: " (str/join ", " missing))))
+
+    (doseq [{:keys [label uid text]} resolved]
+      (roam-set-block-open graph uid open?)
+      (println (str "   " (if open? "📂" "📁") " " label " → " uid " " verb))
+      (println (str "      \"" text "\"")))))
 
 ;; ── Main ─────────────────────────────────────────────────────────────
 
@@ -340,15 +492,34 @@
    :select  {:desc "Select (highlight) block by label character"}
    :e       {:desc "Edit mode: focus block text for typing" :coerce :boolean}
    :edit    {:desc "Edit mode: focus block text for typing" :coerce :boolean}
+   :delete  {:desc "Delete block(s) by label (comma-separated)"}
+   :zoom    {:desc "Zoom into a block by label"}
+   :zoom-parent {:desc "Zoom into parent of a block by label"}
+   :fold    {:desc "Fold (collapse) block(s) by label"}
+   :unfold  {:desc "Unfold (expand) block(s) by label"}
+   :reorder {:desc "Move block(s) to first/last within current parent"}
    :move    {:desc "Move block(s) by label (comma-separated)"}
    :move-selected {:desc "Move currently selected blocks" :coerce :boolean}
    :to      {:desc "Target parent block label for --move/--move-selected"}
+   :ref     {:desc "Target parent block UID for --move/--move-selected"}
+   :page    {:desc "Target page by title for --move/--move-selected"}
+   :before  {:desc "Move before this label (sibling placement)"}
+   :after   {:desc "Move after this label (sibling placement)"}
+   :first   {:desc "Insert as first child (default: last)" :coerce :boolean}
    :s       {:desc "Select in sidebar (optionally nth: -s 2)"}
    :sidebar {:desc "Select in sidebar (optionally nth: --sidebar 2)"}
    :scope   {:desc "Nav scope: main|sidebar|all" :default "all"}})
 
 (let [opts    (cli/parse-opts *command-line-args* {:spec cli-spec})
-      {:keys [graph on off labels label select scope move to]} opts
+      {:keys [graph on off labels label select scope move to delete ref page reorder before after fold unfold zoom]} opts
+      move-order (if (:first opts) "first" "last")
+      move-target (cond
+                    to   {:label (str/upper-case (str/trim to))}
+                    (not-empty ref)    {:uid (str/trim ref)}
+                    (not-empty page)   {:page (str/trim page)}
+                    (not-empty before) {:before (str/upper-case (str/trim before))}
+                    (not-empty after)  {:after (str/upper-case (str/trim after))}
+                    :else nil)
       ;; -s and --sidebar are aliases; -s takes priority
       ;; value can be: true (bare flag), or a number string
       sb-raw  (or (:s opts) (:sidebar opts))
@@ -375,15 +546,24 @@
       select (select-block! graph commands-uid
                             (ensure-labels! graph commands-uid state-uid scope) select
                             {:sidebar sb :edit edit?})
-      move   (if-not to
-               (println "⚠️  --move requires --to <label> for target parent")
+      delete (delete-blocks! graph commands-uid
+                             (ensure-labels! graph commands-uid state-uid scope) delete)
+      zoom   (zoom! graph (ensure-labels! graph commands-uid state-uid scope) zoom)
+      (:zoom-parent opts) (zoom-parent! graph (ensure-labels! graph commands-uid state-uid scope) (:zoom-parent opts))
+      fold   (fold! graph (ensure-labels! graph commands-uid state-uid scope) fold false)
+      unfold (fold! graph (ensure-labels! graph commands-uid state-uid scope) unfold true)
+      reorder (reorder! graph (ensure-labels! graph commands-uid state-uid scope)
+                        reorder move-order)
+      move   (if-not move-target
+               (println "⚠️  --move requires --to <label>, --ref <uid>, or --page <title>")
                (move-blocks! graph (ensure-labels! graph commands-uid state-uid scope)
-                             move to))
+                             move move-target move-order))
       (:move-selected opts)
-             (if-not to
-               (println "⚠️  --move-selected requires --to <label> for target parent")
+             (if-not move-target
+               (println "⚠️  --move-selected requires --to <label>, --ref <uid>, or --page <title>")
                (move-selected! graph commands-uid
-                               (ensure-labels! graph commands-uid state-uid scope) to))
+                               (ensure-labels! graph commands-uid state-uid scope)
+                               move-target move-order))
       label  (act-on-label! graph (ensure-labels! graph commands-uid state-uid scope) label)
       :else  (do (println "Usage:")
                  (println "  bb bridge --on              # turn on nav labels")
@@ -394,9 +574,21 @@
                  (println "  bb bridge --select A -e     # focus block A for editing")
                  (println "  bb bridge --select A -s     # highlight block A in sidebar")
                  (println "  bb bridge --select A -s -e  # edit block A in sidebar")
-                 (println "  bb bridge --move A --to D   # move block A under block D")
-                 (println "  bb bridge --move A,B --to D # move blocks A,B under block D")
-                 (println "  bb bridge --move-selected --to D  # move selected blocks under D")
+                 (println "  bb bridge --zoom A           # zoom into block A")
+                 (println "  bb bridge --zoom-parent A    # zoom into parent of block A")
+                 (println "  bb bridge --fold A           # collapse block A")
+                 (println "  bb bridge --unfold A,B      # expand blocks A and B")
+                 (println "  bb bridge --delete A        # delete block A")
+                 (println "  bb bridge --delete A,B,C    # delete multiple blocks")
+                 (println "  bb bridge --reorder A            # move to last child of parent")
+                 (println "  bb bridge --reorder A --first    # move to first child of parent")
+                 (println "  bb bridge --move A --to D       # move under label D (last child)")
+                 (println "  bb bridge --move A --ref uid    # move under block UID")
+                 (println "  bb bridge --move A --page 'P'   # move to top-level of page P")
+                 (println "  bb bridge --move A --before B   # move A before sibling B")
+                 (println "  bb bridge --move A --after B    # move A after sibling B")
+                 (println "  bb bridge --move A --to D --first # as first child")
+                 (println "  bb bridge --move-selected --to D  # move selected blocks")
                  (println "  bb bridge --label A         # act on block A")))
     (catch clojure.lang.ExceptionInfo e
       (println (str "⚠️  " (ex-message e)))

@@ -29,6 +29,7 @@
  *   scan-blocks — {scope?: "main"|"sidebar"|"all", include_text?: bool}
  *   eval        — {code: "..."}
  *   select-block— {uid|uids, window_id?, mode?: "focus"|"edit"}  ← highlight or edit block(s)
+ *   delete-blocks— {labels?: ["A","B"], uids?: ["uid1"]}        ← delete blocks by label or uid
  *   notify      — {message: "...", intent?: "info"|"warning"|"error"|"success"}
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -718,6 +719,43 @@ async function processCommand(commandBlockUid, cmd) {
           uids,
           mode,
           window_id: windowId,
+        });
+        break;
+      }
+
+      case "delete-blocks": {
+        // Accept labels (resolved via activeLabelMap) or direct uids
+        const labels = args?.labels || [];
+        const directUids = args?.uids || [];
+        const deleted = [];
+        const notFound = [];
+
+        // Resolve labels to UIDs
+        for (const label of labels) {
+          const entry = activeLabelMap[label] || activeLabelMap[label.toUpperCase()];
+          if (entry?.uid) {
+            directUids.push(entry.uid);
+          } else {
+            notFound.push(label);
+          }
+        }
+
+        // Delete each block
+        for (const uid of directUids) {
+          try {
+            await window.roamAlphaAPI.data.block.delete({
+              block: { uid },
+            });
+            deleted.push(uid);
+          } catch (delErr) {
+            notFound.push(uid);
+          }
+        }
+
+        await writeResponse(commandBlockUid, id, "done", {
+          deleted,
+          not_found: notFound,
+          count: deleted.length,
         });
         break;
       }

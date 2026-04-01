@@ -446,6 +446,40 @@ will be included in the response but won't receive a visual highlight.
 See `docs/BLOCK-SELECTION-LIMITATIONS.md` for known limitations of block
 selection.
 
+### `delete-blocks`
+
+Delete one or more blocks by label or UID.
+
+```json
+{
+  "id": "cmd-010",
+  "type": "delete-blocks",
+  "args": {
+    "labels": ["A", "C", "F"]
+  }
+}
+```
+
+**`labels`** (optional): Array of label strings to resolve via the active
+label map. Labels are case-insensitive.
+
+**`uids`** (optional): Array of block UIDs to delete directly (no label
+resolution needed). Can be combined with `labels`.
+
+**Response:**
+```json
+{
+  "deleted": ["J3n66dJ3t", "miiKh8x3o", "VwGoF6d5Q"],
+  "not_found": [],
+  "count": 3
+}
+```
+
+Blocks are deleted with all their children (same as
+`roamAlphaAPI.data.block.delete`). Labels that don't exist in the current
+label map appear in `not_found`. UIDs that fail to delete also appear in
+`not_found`.
+
 ### `eval`
 
 Run arbitrary JavaScript in the Roam browser context. Has access to
@@ -618,9 +652,20 @@ bb bridge --select A,B,C          # highlight multiple blocks
 bb bridge --select A -e           # focus block A for editing
 bb bridge --select A -s           # highlight block A in sidebar
 bb bridge --select A -s -e        # edit block A in sidebar
-bb bridge --move A --to D         # move block A under block D
-bb bridge --move A,B --to D       # move blocks A,B under block D
-bb bridge --move-selected --to D  # move currently selected blocks under D
+bb bridge --fold A                # collapse block A
+bb bridge --unfold A,B            # expand blocks A and B
+bb bridge --delete A              # delete block A
+bb bridge --delete A,B,C          # delete multiple blocks
+bb bridge --reorder A              # move to last child of current parent
+bb bridge --reorder A --first      # move to first child of current parent
+bb bridge --move A --to D          # move under label D (last child)
+bb bridge --move A --ref VwGoF6d5Q # move under block UID
+bb bridge --move A --page 'Tasks'  # move to top-level of page "Tasks"
+bb bridge --move A --before B       # move A before sibling B
+bb bridge --move A --after B       # move A after sibling B
+bb bridge --move A,B --to D        # move multiple blocks under label D
+bb bridge --move A --to D --first  # insert as first child
+bb bridge --move-selected --to D   # move currently selected blocks
 bb bridge --label A               # ⚠️ deprecated — append timestamp to block A
 ```
 
@@ -634,9 +679,18 @@ bb bridge --label A               # ⚠️ deprecated — append timestamp to bl
 | `--labels` | Print current label→uid mapping | |
 | `--select <label>` | Select/highlight block(s) by label (comma-separated) | |
 | `-e` / `--edit` | Edit mode: focus block text for typing | |
+| `--fold <labels>` | Collapse block(s) by label (comma-separated) | |
+| `--unfold <labels>` | Expand block(s) by label (comma-separated) | |
+| `--delete <labels>` | Delete block(s) by label (comma-separated) | |
+| `--reorder <labels>` | Move block(s) to first/last child within current parent | |
 | `--move <labels>` | Move block(s) by label (comma-separated) | |
 | `--move-selected` | Move currently selected (highlighted) blocks | |
-| `--to <label>` | Target parent block label for `--move` / `--move-selected` | |
+| `--to <label>` | Target parent block by label for `--move` / `--move-selected` | |
+| `--ref <uid>` | Target parent block by UID for `--move` / `--move-selected` | |
+| `--page <title>` | Target page by title for `--move` / `--move-selected` | |
+| `--before <label>` | Move as sibling before this label | |
+| `--after <label>` | Move as sibling after this label | |
+| `--first` | Insert as first child instead of last | |
 | `-s` / `--sidebar` | Select in sidebar (optionally Nth: `-s 2`) | |
 | `--scope` | Nav scope: `main` \| `sidebar` \| `all` | `all` |
 | `--label <X>` | **Deprecated.** Legacy action that appends a ✅ timestamp to a block. Use `--select <X>` instead for highlighting, or operate on blocks directly via the Local API | |
