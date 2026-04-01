@@ -602,6 +602,13 @@ async function processCommand(commandBlockUid, cmd) {
         break;
       }
 
+      case "clear-selection": {
+        clearSelectHighlight();
+        lastStateJson = null;
+        await writeResponse(commandBlockUid, id, "done", {});
+        break;
+      }
+
       case "get-view": {
         const state = await captureViewState();
         await writeResponse(commandBlockUid, id, "done", state);

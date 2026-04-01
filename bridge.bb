@@ -285,6 +285,44 @@
                         (if (= wid "main-window") "" (str " [" wid "]"))))
           (println (str "   \"" text "\"")))))))
 
+(defn- get-current-selection
+  "Get the current selection from the bridge via get-view (always fresh)."
+  [graph commands-uid]
+  (let [resp (send-command! graph commands-uid
+               (str "gv-" (System/currentTimeMillis)) "get-view" {})]
+    (vec (or (get-in resp [:result :selected]) []))))
+
+(defn select-add!
+  "Add block(s) to the current selection without clearing existing."
+  [graph commands-uid state label-str]
+  (let [label-keys (map str/trim (str/split (str/upper-case label-str) #","))
+        current    (get-current-selection graph commands-uid)
+        new-uids   (keep (fn [lbl] (resolve-uid state lbl)) label-keys)
+        combined   (vec (distinct (concat current new-uids)))]
+    (when (seq new-uids)
+      (send-command! graph commands-uid
+        (str "sel-" (System/currentTimeMillis)) "select-block"
+        {:uids combined :window_id "main-window" :mode "focus"})
+      (println (str "🎯 Added " (count new-uids) " → " (count combined) " total selected")))))
+
+(defn select-remove!
+  "Remove block(s) from the current selection."
+  [graph commands-uid state label-str]
+  (let [label-keys  (map str/trim (str/split (str/upper-case label-str) #","))
+        current     (get-current-selection graph commands-uid)
+        remove-uids (set (keep (fn [lbl] (resolve-uid state lbl)) label-keys))
+        remaining   (vec (remove remove-uids current))]
+    (if (seq remaining)
+      (do
+        (send-command! graph commands-uid
+          (str "sel-" (System/currentTimeMillis)) "select-block"
+          {:uids remaining :window_id "main-window" :mode "focus"})
+        (println (str "🎯 Removed " (count remove-uids) " → " (count remaining) " remaining")))
+      (do
+        (send-command! graph commands-uid
+          (str "clrsel-" (System/currentTimeMillis)) "clear-selection" {})
+        (println "🎯 Selection cleared")))))
+
 (defn move-blocks!
   "Move block(s) by label under a target parent block.
    source-str: comma-separated labels of blocks to move
@@ -459,6 +497,124 @@
         (println (str "🔎 parent of " (str/upper-case label) " → " parent " zoomed"))
         (println (str "   \"" text "\""))))))
 
+(defn- create-and-focus-block!
+  "Create an empty block under parent-uid and focus it for editing.
+   order: \"first\", \"last\", or a numeric position."
+  [graph parent-uid order label]
+  (let [new-uid   (str "nb-" (subs (str (java.util.UUID/randomUUID)) 0 9))
+        api-order (cond (= order "first") 0
+                        (= order "last")  "last"
+                        :else              order)]
+    (roam-api graph "data.block.create"
+              {"location" {"parent-uid" parent-uid "order" api-order}
+               "block"    {"uid" new-uid "string" ""}})
+    (roam-api graph "ui.setBlockFocusAndSelection"
+              {"location" {"block-uid" new-uid "window-id" "main-window"}})
+    (println (str "✏️  New block " new-uid " created (" order ") under " label))
+    (println "   Ready for input.")))
+
+(defn new-block!
+  "Create a new block on a page and focus it for editing.
+   page-title: page to create under (uses current page if nil/empty)
+   order: \"first\" or \"last\" (default \"first\")"
+  [graph state-uid page-title order]
+  (let [order    (or order "first")
+        page-uid (if (not-empty page-title)
+                   (let [uid (get-page-uid graph page-title)]
+                     (when-not uid
+                       (throw (ex-info (str "Page \"" page-title "\" not found") {})))
+                     uid)
+                   (let [state (read-state graph state-uid)]
+                     (or (get-in state [:main :uid])
+                         (throw (ex-info "Cannot determine current page" {})))))]
+    ;; Navigate to the page if a title was specified
+    (when (not-empty page-title)
+      (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}}))
+    (create-and-focus-block! graph page-uid order (or page-title "current page"))))
+
+(defn new-sibling!
+  "Create a new sibling block in the current parent context.
+   Reads the focused block from state, finds its parent, and creates
+   a new block at the top or bottom of that parent's children.
+   Falls back to current view root if no block is focused."
+  [graph state-uid order]
+  (let [order  (or order "first")
+        state  (read-state graph state-uid)
+        ;; Try focused block first, fall back to main view uid
+        focus-uid (get-in state [:focused :block-uid])
+        parent-uid (if focus-uid
+                     (or (get-parent-uid graph focus-uid)
+                         (get-in state [:main :uid]))
+                     (get-in state [:main :uid]))]
+    (when-not parent-uid
+      (throw (ex-info "Cannot determine current parent" {})))
+    (create-and-focus-block! graph parent-uid order
+                             (if focus-uid
+                               (str "parent of " focus-uid)
+                               "current page"))))
+
+(defn new-before-after!
+  "Create a new empty block before or after a labeled block, and focus it.
+   position: :before or :after"
+  [graph state label position]
+  (let [uid (resolve-uid state (str/trim label))]
+    (when-not uid
+      (throw (ex-info (str "Label " (str/upper-case label) " not found")
+                      {:available (when-let [lbls (:labels state)]
+                                    (sort (map name (keys lbls))))})))
+    (let [parent (get-parent-uid graph uid)
+          order  (get-block-order graph uid)]
+      (when-not parent
+        (throw (ex-info (str "Cannot find parent of block " (str/upper-case label)) {})))
+      (let [insert-order (if (= position :before) order (inc order))]
+        (create-and-focus-block! graph parent insert-order
+                                 (str (name position) " " (str/upper-case label)))))))
+
+(defn new-child!
+  "Create a new child block under a block targeted by label or UID.
+   Tries label resolution first, falls back to raw UID.
+   order: \"first\" or \"last\" (default \"first\")"
+  [graph state ref order]
+  (when (empty? ref)
+    (throw (ex-info "Label or block UID required for --new-child" {})))
+  (let [order      (or order "first")
+        ;; Try label resolution first, fall back to raw UID
+        label-uid  (when state (resolve-uid state ref))
+        parent-uid (or label-uid ref)
+        label      (if label-uid
+                     (str (str/upper-case ref) " → " parent-uid)
+                     parent-uid)]
+    (create-and-focus-block! graph parent-uid order label)))
+
+(defn open-in-sidebar!
+  "Open a block by label in the right sidebar."
+  [graph state label]
+  (let [uid (resolve-uid state (str/trim label))]
+    (when-not uid
+      (throw (ex-info (str "Label " (str/upper-case label) " not found")
+                      {:available (when-let [lbls (:labels state)]
+                                    (sort (map name (keys lbls))))})))
+    (let [text (or (get-block-string graph uid) "")]
+      (roam-api graph "ui.rightSidebar.addWindow"
+                {"window" {"type" "outline" "block-uid" uid}})
+      (println (str "📌 " (str/upper-case label) " → " uid " opened in sidebar"))
+      (println (str "   \"" text "\"")))))
+
+(defn zoom-out!
+  "Zoom out to parent of the current root block in main view."
+  [graph state-uid]
+  (let [state     (read-state graph state-uid)
+        current   (get-in state [:main :uid])]
+    (when-not current
+      (throw (ex-info "Cannot determine current view" {})))
+    (let [parent (get-parent-uid graph current)]
+      (when-not parent
+        (throw (ex-info "Already at page level — cannot zoom out further" {})))
+      (let [text (or (get-block-string graph parent) "")]
+        (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" parent}})
+        (println (str "🔎 zoomed out → " parent))
+        (println (str "   \"" text "\""))))))
+
 (defn fold!
   "Fold (collapse) or unfold (expand) block(s) by label.
    label-str: comma-separated labels
@@ -490,10 +646,20 @@
    :labels  {:desc "Print current label map" :coerce :boolean}
    :label   {:desc "Act on block by label character"}
    :select  {:desc "Select (highlight) block by label character"}
+   :select-add {:desc "Add block(s) to current selection"}
+   :select-remove {:desc "Remove block(s) from current selection"}
    :e       {:desc "Edit mode: focus block text for typing" :coerce :boolean}
    :edit    {:desc "Edit mode: focus block text for typing" :coerce :boolean}
    :delete  {:desc "Delete block(s) by label (comma-separated)"}
+   :new-block {:desc "Create new block on page (title), or current page if empty"}
+   :new-block-last {:desc "Create new block at bottom of current page" :coerce :boolean}
+   :new-sibling {:desc "New block in current parent (top/bottom)" :coerce :boolean}
+   :new-before {:desc "New block before a labeled block"}
+   :new-after {:desc "New block after a labeled block"}
+   :new-child {:desc "Create new child block under a block UID"}
+   :open-sidebar {:desc "Open a block by label in the right sidebar"}
    :zoom    {:desc "Zoom into a block by label"}
+   :zoom-out {:desc "Zoom out to parent of current view" :coerce :boolean}
    :zoom-parent {:desc "Zoom into parent of a block by label"}
    :fold    {:desc "Fold (collapse) block(s) by label"}
    :unfold  {:desc "Unfold (expand) block(s) by label"}
@@ -506,6 +672,7 @@
    :before  {:desc "Move before this label (sibling placement)"}
    :after   {:desc "Move after this label (sibling placement)"}
    :first   {:desc "Insert as first child (default: last)" :coerce :boolean}
+   :last    {:desc "Insert as last child" :coerce :boolean}
    :s       {:desc "Select in sidebar (optionally nth: -s 2)"}
    :sidebar {:desc "Select in sidebar (optionally nth: --sidebar 2)"}
    :scope   {:desc "Nav scope: main|sidebar|all" :default "all"}})
@@ -546,9 +713,32 @@
       select (select-block! graph commands-uid
                             (ensure-labels! graph commands-uid state-uid scope) select
                             {:sidebar sb :edit edit?})
+      (:select-add opts) (select-add! graph commands-uid
+                                      (ensure-labels! graph commands-uid state-uid scope)
+                                      (:select-add opts))
+      (:select-remove opts) (select-remove! graph commands-uid
+                                            (ensure-labels! graph commands-uid state-uid scope)
+                                            (:select-remove opts))
       delete (delete-blocks! graph commands-uid
                              (ensure-labels! graph commands-uid state-uid scope) delete)
+      (contains? opts :new-block) (let [v (:new-block opts)]
+                                   (new-block! graph state-uid (when (string? v) v)
+                                               (if (:last opts) "last" "first")))
+      (:new-block-last opts) (new-block! graph state-uid nil "last")
+      (:new-sibling opts) (new-sibling! graph state-uid (if (:last opts) "last" "first"))
+      (not-empty (:new-before opts)) (new-before-after! graph
+                                                (ensure-labels! graph commands-uid state-uid scope)
+                                                (:new-before opts) :before)
+      (not-empty (:new-after opts)) (new-before-after! graph
+                                                (ensure-labels! graph commands-uid state-uid scope)
+                                                (:new-after opts) :after)
+      (not-empty (:new-child opts)) (new-child! graph
+                                                (ensure-labels! graph commands-uid state-uid scope)
+                                                (:new-child opts)
+                                                (if (:last opts) "last" "first"))
+      (:open-sidebar opts) (open-in-sidebar! graph (ensure-labels! graph commands-uid state-uid scope) (:open-sidebar opts))
       zoom   (zoom! graph (ensure-labels! graph commands-uid state-uid scope) zoom)
+      (:zoom-out opts) (zoom-out! graph state-uid)
       (:zoom-parent opts) (zoom-parent! graph (ensure-labels! graph commands-uid state-uid scope) (:zoom-parent opts))
       fold   (fold! graph (ensure-labels! graph commands-uid state-uid scope) fold false)
       unfold (fold! graph (ensure-labels! graph commands-uid state-uid scope) unfold true)
@@ -573,8 +763,23 @@
                  (println "  bb bridge --select A,B,C    # highlight multiple blocks")
                  (println "  bb bridge --select A -e     # focus block A for editing")
                  (println "  bb bridge --select A -s     # highlight block A in sidebar")
-                 (println "  bb bridge --select A -s -e  # edit block A in sidebar")
+                                  (println "  bb bridge --select A -s -e    # edit block A in sidebar")
+                                  (println "  bb bridge --select-add A,B    # add to current selection")
+                                  (println "  bb bridge --select-remove A   # remove from selection")
+                 (println "  bb bridge --new-block 'Page'  # new block at top of page, focused")
+                 (println "  bb bridge --new-block         # new block at top of current page")
+                 (println "  bb bridge --new-block --last  # new block at bottom of current page")
+                 (println "  bb bridge --new-block-last    # shorthand for above")
+                 (println "  bb bridge --new-sibling       # new block at top of current parent")
+                 (println "  bb bridge --new-sibling --last # new block at bottom of current parent")
+                 (println "  bb bridge --new-before A      # new block before block A, focused")
+                 (println "  bb bridge --new-after A       # new block after block A, focused")
+                 (println "  bb bridge --new-child A       # new child at top of labeled block")
+                 (println "  bb bridge --new-child uid     # new child at top of block by UID")
+                 (println "  bb bridge --new-child A --last # new child at bottom")
+                 (println "  bb bridge --open-sidebar A   # open block A in right sidebar")
                  (println "  bb bridge --zoom A           # zoom into block A")
+                 (println "  bb bridge --zoom-out         # zoom out to parent of current view")
                  (println "  bb bridge --zoom-parent A    # zoom into parent of block A")
                  (println "  bb bridge --fold A           # collapse block A")
                  (println "  bb bridge --unfold A,B      # expand blocks A and B")
