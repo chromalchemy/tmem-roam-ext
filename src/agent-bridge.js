@@ -62,12 +62,24 @@ let navModeActive = false;
 let navModeScope = "all";
 let renderingInProgress = false; // suppress observer during our own DOM writes
 let activeClearOnInteract = null; // tracked for cleanup on unload
+let selectedBlockUids = []; // UIDs of blocks highlighted via select-block focus mode
+let toasterInstance = null; // cached Blueprint Toaster (avoids React root leaks)
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+/** Validate a Roam block/page UID (alphanumeric, hyphens, underscores). */
+function isValidUid(uid) {
+  return typeof uid === "string" && /^[\w-]+$/.test(uid);
+}
+
 /** Escape a string for safe interpolation into Datalog query strings. */
 function escDq(s) {
-  return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return String(s)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
 }
 
 function generateUID() {
@@ -102,7 +114,7 @@ function getChildByString(parentUid, str) {
       [?p :block/children ?c]
       [?c :block/uid ?uid]
       [?c :block/string ?s]
-      [(clojure.string/starts-with? ?s "${escDq(str)}")]
+      [(= ?s "${escDq(str)}")]
     ]`
   );
   return result?.[0]?.[0] || null;
@@ -190,9 +202,9 @@ function clearAllAnnotations() {
   renderingInProgress = false;
 }
 
-function renderAnnotations(blocks) {
+function renderAnnotations(blocks = []) {
   renderingInProgress = true;
-  const newBlocks = blocks || [];
+  const newBlocks = blocks;
   const newUids = new Set(newBlocks.map((b) => b.uid));
 
   // Build a lookup of new block annotations by uid
@@ -243,6 +255,7 @@ function renderAnnotations(blocks) {
 function applyAnnotationsToDOM() {
   renderingInProgress = true;
   for (const { uid, label, intent } of currentAnnotations) {
+    if (!isValidUid(uid)) continue; // skip malformed UIDs
     const blockEls = document.querySelectorAll(
       `.roam-block-container[data-block-uid="${uid}"]`
     );
@@ -340,7 +353,6 @@ function scanVisibleBlocks(scope = "all", includeText = true) {
 
 // Active label mapping, exported to state writer
 let activeLabelMap = {}; // {"A": {uid: "uid1", region: "main"}, ...}
-let selectedBlockUids = []; // UIDs of blocks highlighted via select-block focus mode
 
 function updateLabelMap(scannedBlocks) {
   activeLabelMap = {};
@@ -495,17 +507,18 @@ async function writeViewState() {
   if (!stateBlockUid || stateWriteInProgress) return;
   stateWriteInProgress = true;
   try {
-    // In nav-mode, check if view changed → rescan (synchronous, no recursion)
+    // Capture once; in nav-mode, check fingerprint → rescan if changed,
+    // then re-capture only when labels were updated.
+    let state = await captureViewState();
     if (navModeActive) {
-      const preState = await captureViewState();
-      const vfp = viewFingerprint(preState);
+      const vfp = viewFingerprint(state);
       if (vfp !== lastNavViewKey) {
         lastNavViewKey = vfp;
         navRescan(); // updates annotations + labels, invalidates lastStateJson
+        state = await captureViewState(); // re-capture with fresh labels
       }
     }
 
-    const state = await captureViewState();
     const json = JSON.stringify(state);
 
     // Skip write if nothing changed (ignore ts field for comparison)
@@ -539,6 +552,8 @@ async function writeViewState() {
 }
 
 function startStatePolling() {
+  // Guard against leaked intervals if called twice
+  if (stateInterval) clearInterval(stateInterval);
   // Write initial state immediately
   writeViewState();
   stateInterval = setInterval(writeViewState, POLL_INTERVAL_MS);
@@ -634,7 +649,7 @@ async function processCommand(commandBlockUid, cmd) {
 
       case "select-block": {
         // Accept single uid or array of uids
-        const uids = args?.uids || (args?.uid ? [args.uid] : []);
+        const uids = (args?.uids || (args?.uid ? [args.uid] : [])).filter(isValidUid);
         const windowId = args?.window_id || "main-window";
         const mode = args?.mode || "focus"; // "focus" = highlight, "edit" = text input
 
@@ -719,7 +734,7 @@ async function processCommand(commandBlockUid, cmd) {
 
           // Force immediate state write so selected uids are available
           lastStateJson = null;
-          writeViewState();
+          await writeViewState();
         }
 
         await writeResponse(commandBlockUid, id, "done", {
@@ -733,7 +748,7 @@ async function processCommand(commandBlockUid, cmd) {
       case "delete-blocks": {
         // Accept labels (resolved via activeLabelMap) or direct uids
         const labels = args?.labels || [];
-        const directUids = args?.uids || [];
+        const directUids = [...(args?.uids || [])].filter(isValidUid);
         const deleted = [];
         const notFound = [];
 
@@ -829,13 +844,12 @@ async function processCommand(commandBlockUid, cmd) {
       case "notify": {
         const message = args?.message || "Agent notification";
         const intent = args?.intent || "info"; // info, warning, error, success
-        // Roam's blueprint toast (cached instance to avoid React root leak)
+        // Roam's blueprint toast (module-scoped to avoid global pollution)
         if (window.blueprintjs?.core?.Toaster) {
-          if (!window._agentBridgeToaster) {
-            window._agentBridgeToaster =
-              window.blueprintjs.core.Toaster.create({});
+          if (!toasterInstance) {
+            toasterInstance = window.blueprintjs.core.Toaster.create({});
           }
-          window._agentBridgeToaster.show({
+          toasterInstance.show({
             message,
             intent,
             timeout: 4000,
@@ -925,6 +939,10 @@ function startCommandWatch() {
       const str = child?.[":block/string"];
       const uid = child?.[":block/uid"];
       if (!str || !uid) continue;
+      // Skip commands that already have a response child (durable "processed" marker).
+      // This prevents replay even after processedCommandIds eviction.
+      const grandchildren = child?.[":block/children"] || [];
+      if (grandchildren.length > 0) continue;
       // Commands are JSON strings
       try {
         const cmd = JSON.parse(str);
@@ -938,7 +956,7 @@ function startCommandWatch() {
   };
 
   window.roamAlphaAPI.data.addPullWatch(
-    "[:block/string :block/uid {:block/children [:block/string :block/uid]}]",
+    "[:block/string :block/uid {:block/children [:block/string :block/uid {:block/children [:block/string :block/uid]}]}]",
     `[:block/uid "${commandsBlockUid}"]`,
     pullWatchCallback
   );
@@ -947,7 +965,7 @@ function startCommandWatch() {
 function stopCommandWatch() {
   if (!commandsBlockUid || !pullWatchCallback) return;
   window.roamAlphaAPI.data.removePullWatch(
-    "[:block/string :block/uid {:block/children [:block/string :block/uid]}]",
+    "[:block/string :block/uid {:block/children [:block/string :block/uid {:block/children [:block/string :block/uid]}]}]",
     `[:block/uid "${commandsBlockUid}"]`,
     pullWatchCallback
   );
@@ -1014,6 +1032,7 @@ export function onunload() {
     activeClearOnInteract = null;
   }
 
+  toasterInstance = null;
   bridgePageUid = null;
   commandsBlockUid = null;
   stateBlockUid = null;
