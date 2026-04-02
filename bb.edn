@@ -11,7 +11,4 @@
                :task (shell "bb serve_https.bb")}
 
   build {:doc "Build extension.js"
-         :task (shell "npm run build")}
-
-  bridge {:doc "Demo: scan blocks, target by label, watch for view changes"
-          :task (apply shell "bb bridge.bb" *command-line-args*)}}}
+         :task (shell "npm run build")}}}
