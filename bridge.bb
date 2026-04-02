@@ -36,7 +36,10 @@
   [s]
   (-> (str s)
       (str/replace "\\" "\\\\")
-      (str/replace "\"" "\\\"")))
+      (str/replace "\"" "\\\"")
+      (str/replace "\n" "\\n")
+      (str/replace "\r" "\\r")
+      (str/replace "\t" "\\t")))
 
 ;; ── Roam Local API ───────────────────────────────────────────────────
 
