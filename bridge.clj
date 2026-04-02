@@ -733,8 +733,9 @@
 
    Source (one required): :labels [:A :B], :source-uid \"uid\", :selected true
    Target (one required): :label :D, :uid \"uid\", :page \"title\"
-   Options: :position :first/:last/:before/:after, :mode :link/:alias"
-  [{:keys [labels source-uid selected label uid page position mode]}]
+   Options: :position :first/:last/:before/:after
+            :action :move (default), :link, :alias"
+  [{:keys [labels source-uid selected label uid page position action]}]
   (let [source (cond
                  labels     {:labels labels}
                  source-uid {:source-uid source-uid}
@@ -751,7 +752,7 @@
         order  (when (#{:first :last} position) position)
         opts   (cond-> {}
                   order (assoc :order order)
-                  (= mode :alias) (assoc :alias true))]
-    (if (= mode :link)
+                  (= action :alias) (assoc :alias true))]
+    (if (= action :link)
       (link! source target (select-keys opts [:order]))
       (move! source target opts))))
