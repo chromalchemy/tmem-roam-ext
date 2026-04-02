@@ -726,3 +726,27 @@
                               (get-current-selection graph commands-uid))}
                source)]
      (do-link! graph state src target order))))
+
+(defn transfer!
+  "Unified move/link entry point for voice commands.
+   Composes source, target, position, and mode into a move! or link! call.
+
+   source:   {:labels [:A]} | {:source-uid \"uid\"} | {:selected true}
+   target:   {:label :D} | {:uid \"uid\"} | {:page \"title\"}
+   position: :first/:last/:before/:after or nil
+   mode:     :link or :alias or nil (plain move)"
+  ([source target] (transfer! source target nil nil))
+  ([source target position] (transfer! source target position nil))
+  ([source target position mode]
+   (let [;; :before/:after positions rewrite the target key
+         target (if (#{:before :after} position)
+                  (let [[_k v] (first target)]
+                    {position v})
+                  target)
+         order  (when (#{:first :last} position) position)
+         opts   (cond-> {}
+                  order (assoc :order order)
+                  (= mode :alias) (assoc :alias true))]
+     (if (= mode :link)
+       (link! source target (select-keys opts [:order]))
+       (move! source target opts)))))
