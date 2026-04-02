@@ -336,15 +336,30 @@
 
 (defn- resolve-source-uids
   "Resolve source blocks from labels, selection, or direct UID.
+   If :parent is true, walks up one level from each resolved block.
+   :parent alone (no other source key) uses the current focused block.
    Returns a vec of {:uid :label :text} maps."
-  [graph state {:keys [labels selected source-uid]}]
-  (cond
-    labels   (:resolved (resolve-labels graph state labels))
-    selected (mapv (fn [uid] {:uid uid :label nil
-                              :text (or (get-block-string graph uid) "")})
-                   selected)
-    source-uid [{:uid source-uid :label nil
-                 :text (or (get-block-string graph source-uid) "")}]))
+  [graph state {:keys [labels selected source-uid parent]}]
+  (let [base (cond
+               labels     (:resolved (resolve-labels graph state labels))
+               selected   (mapv (fn [uid] {:uid uid :label nil
+                                           :text (or (get-block-string graph uid) "")})
+                                selected)
+               source-uid [{:uid source-uid :label nil
+                            :text (or (get-block-string graph source-uid) "")}]
+               ;; parent alone: start from focused block
+               parent     (let [uid (get-in state [:focused :block-uid])]
+                            (when-not uid
+                              (throw (ex-info "No focused block for parent source" {})))
+                            [{:uid uid :label nil
+                              :text (or (get-block-string graph uid) "")}]))]
+    (if parent
+      (vec (keep (fn [{:keys [uid label]}]
+                   (when-let [pu (get-parent-uid graph uid)]
+                     {:uid pu :label label
+                      :text (or (get-block-string graph pu) "")}))
+                 base))
+      (vec base))))
 
 (defn do-move!
   "Unified move: resolve sources and target, then move.
