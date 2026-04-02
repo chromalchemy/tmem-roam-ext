@@ -196,8 +196,20 @@
         (println (str "   Available: " (str/join ", " (sort (map name (keys lbls))))))))
     {:resolved (vec resolved) :missing (vec missing)}))
 
+(defn is-descendant?
+  "Check if target-uid is a descendant of source-uid (or is source-uid itself).
+   Walks up the tree from target. Returns true if moving source under target
+   would create a cycle."
+  [graph source-uid target-uid]
+  (loop [cur target-uid depth 0]
+    (cond
+      (nil? cur)              false
+      (= cur source-uid)      true
+      (>= depth 50)           false ;; safety limit
+      :else (recur (get-parent-uid graph cur) (inc depth)))))
+
 (defn resolve-target
-  "Resolve a target map to {:uid, :name, :order}.
+  "Resolve a target map to {:uid, :name, :order, :anchor-uid}.
    target: {:label \"D\"}, {:uid \"...\"}, {:page \"...\"}, {:before \"B\"}, {:after \"B\"}
    default-order: \"first\" or \"last\""
   [graph state target default-order]
@@ -224,7 +236,7 @@
         (throw (ex-info (str "Target " tgt-name " not found")
                         {:available (when-let [lbls (:labels state)]
                                       (sort (map name (keys lbls))))})))
-      {:uid uid :name tgt-name :order order})))
+      {:uid uid :name tgt-name :order order :anchor-uid anchor-uid})))
 
 (defn act-on-label! [graph state label]
   (let [uid (resolve-uid state label)]
@@ -361,135 +373,98 @@
           (str "clrsel-" (System/currentTimeMillis)) "clear-selection" {})
         (println "🎯 Selection cleared")))))
 
-(defn move-blocks!
-  "Move block(s) by label under a target parent block.
-   source-str: comma-separated labels of blocks to move
-   target: {:label \"D\"}, {:uid \"abc123\"}, {:page \"Title\"},
-           {:before \"B\"}, or {:after \"B\"}
-   order: \"first\" or \"last\" (default \"last\", ignored for before/after)
-   alias?: when true, leave a block reference ((uid)) at the original location"
-  [graph state source-str target order alias?]
-  (let [{:keys [resolved]} (resolve-labels graph state source-str)
-        tgt (resolve-target graph state target order)]
-    (when (seq resolved)
-      (let [tgt-text (or (get-block-string graph (:uid tgt)) "")]
-        (println (str "📦 Moving " (count resolved) " block(s) " (:name tgt)
-                      (when alias? " (with alias)")))
-        (println (str "   target: \"" tgt-text "\"")))
-      (doseq [[idx {:keys [label uid text]}] (map-indexed vector resolved)]
-        ;; Offset order for positional (before/after) multi-block moves
-        (let [effective-order (if (number? (:order tgt))
-                                (+ (:order tgt) idx)
-                                (:order tgt))
-              ;; Capture original position before moving (for alias backfill)
-              orig-parent (when alias? (get-parent-uid graph uid))
-              orig-order  (when alias? (get-block-order graph uid))]
-          ;; Move first
+;; ── Core move/link operations (shared by all source types) ───────
+
+(defn move-uids!
+  "Core move operation. Moves a vec of {:uid :label :text} blocks to a target.
+   Handles cycle checks, positional ordering, and alias backfill."
+  [graph uids tgt alias?]
+  (let [tgt-text (or (get-block-string graph (:uid tgt)) "")]
+    (println (str "📦 Moving " (count uids) " block(s) → " (:name tgt)
+                  (when alias? " (with alias)")))
+    (println (str "   target: \"" tgt-text "\"")))
+  (doseq [[idx {:keys [label uid text]}] (map-indexed vector uids)]
+    (let [cycle-target (or (:anchor-uid tgt) (:uid tgt))
+          skip? (is-descendant? graph uid cycle-target)
+          effective-order (if (number? (:order tgt))
+                            (+ (:order tgt) idx)
+                            (:order tgt))
+          orig-parent (when (and alias? (not skip?)) (get-parent-uid graph uid))
+          orig-order  (when (and alias? (not skip?)) (get-block-order graph uid))]
+      (if skip?
+        (do (println (str "   ⛔ " (or label uid) " SKIPPED — target is a descendant"))
+            (println "      Moving a block under its own subtree would corrupt the graph."))
+        (do
           (roam-move-block graph uid (:uid tgt) effective-order)
-          ;; Then backfill alias at the now-vacant position
           (when (and alias? orig-parent)
             (roam-api graph "data.block.create"
                       {"location" {"parent-uid" orig-parent "order" (or orig-order "last")}
                        "block"    {"string" (str "((" uid "))")}})
-            (println (str "   🔗 alias ((" uid ")) left at original location"))))
-        (println (str "   ✅ " label " → " uid " moved"))
-        (println (str "      \"" text "\""))))))
+            (println (str "   🔗 alias ((" uid ")) left at original location")))
+          (println (str "   ✅ " (or label uid) " moved"))
+          (println (str "      \"" text "\"")))))))
 
-(defn move-selected!
-  "Move the currently selected (highlighted) blocks to a target parent.
-   Reads selected UIDs from __state__.selected, moves them, then re-selects.
-   target: {:label \"D\"}, {:uid \"abc123\"}, {:before \"B\"}, {:after \"B\"}
-   order: \"first\" or \"last\" (default \"last\")
-   alias?: when true, leave a block reference ((uid)) at each original location"
-  [graph commands-uid state target order alias?]
-  (let [selected (:selected state)
-        tgt (resolve-target graph state target order)]
+(defn link-uids!
+  "Core link operation. Creates ((uid)) refs at target for a vec of {:uid :label :text}."
+  [graph uids tgt]
+  (let [tgt-text (or (get-block-string graph (:uid tgt)) "")]
+    (println (str "🔗 Linking " (count uids) " block(s) → " (:name tgt)))
+    (println (str "   target: \"" tgt-text "\"")))
+  (doseq [[idx {:keys [label uid text]}] (map-indexed vector uids)]
+    (let [effective-order (if (number? (:order tgt))
+                            (+ (:order tgt) idx)
+                            (:order tgt))]
+      (roam-api graph "data.block.create"
+                {"location" {"parent-uid" (:uid tgt) "order" effective-order}
+                 "block"    {"string" (str "((" uid "))")}})
+      (println (str "   🔗 " (or label uid) " → ((" uid ")) created"))
+      (println (str "      \"" text "\"")))))
 
+;; ── Source resolution wrappers ───────────────────────────────────
+
+(defn- resolve-source-uids
+  "Resolve source blocks from labels, selection, or direct UID.
+   Returns a vec of {:uid :label :text} maps."
+  [graph state {:keys [labels selected source-uid]}]
+  (cond
+    labels   (:resolved (resolve-labels graph state labels))
+    selected (mapv (fn [uid] {:uid uid :label nil
+                              :text (or (get-block-string graph uid) "")})
+                   selected)
+    source-uid [{:uid source-uid :label nil
+                 :text (or (get-block-string graph source-uid) "")}]))
+
+(defn do-move!
+  "Unified move: resolve sources and target, then move.
+   source: {:labels \"A,B\"} or {:selected [...]} or {:source-uid \"abc\"}
+   target-map, order, alias? as before."
+  [graph state source target-map order alias?]
+  (let [uids (resolve-source-uids graph state source)
+        tgt  (resolve-target graph state target-map order)]
+    (when (seq uids)
+      (move-uids! graph uids tgt alias?))))
+
+(defn do-link!
+  "Unified link: resolve sources and target, then create refs."
+  [graph state source target-map order]
+  (let [uids (resolve-source-uids graph state source)
+        tgt  (resolve-target graph state target-map order)]
+    (when (seq uids)
+      (link-uids! graph uids tgt))))
+
+(defn do-move-selected!
+  "Move selected blocks with re-selection after move."
+  [graph commands-uid state target-map order alias?]
+  (let [selected (:selected state)]
     (when-not (seq selected)
       (throw (ex-info "No blocks currently selected. Use --select first." {})))
-
-    (let [tgt-text (or (get-block-string graph (:uid tgt)) "")]
-      (println (str "📦 Moving " (count selected) " selected block(s) under "
-                    (:name tgt) " → " (:uid tgt) " (" (:order tgt) ")"
-                    (when alias? " (with alias)")))
-      (println (str "   target: \"" tgt-text "\"")))
-
-    (doseq [[idx uid] (map-indexed vector selected)]
-      (let [effective-order (if (number? (:order tgt))
-                              (+ (:order tgt) idx)
-                              (:order tgt))
-            text (or (get-block-string graph uid) "")
-            ;; Capture original position before moving (for alias backfill)
-            orig-parent (when alias? (get-parent-uid graph uid))
-            orig-order  (when alias? (get-block-order graph uid))]
-        ;; Move first
-        (roam-move-block graph uid (:uid tgt) effective-order)
-        ;; Then backfill alias at the now-vacant position
-        (when (and alias? orig-parent)
-          (roam-api graph "data.block.create"
-                    {"location" {"parent-uid" orig-parent "order" (or orig-order "last")}
-                     "block"    {"string" (str "((" uid "))")}})
-          (println (str "   🔗 alias ((" uid ")) left at original location")))
-        (println (str "   ✅ " uid " moved"))
-        (println (str "      \"" text "\""))))
-
+    (do-move! graph state {:selected selected} target-map order alias?)
     ;; Re-select the moved blocks at their new location
-    (Thread/sleep 200) ;; let Roam process the moves
+    (Thread/sleep 200)
     (send-command! graph commands-uid
       (str "sel-" (System/currentTimeMillis)) "select-block"
       {:uids (vec selected) :window_id "main-window" :mode "focus"})
     (println (str "🎯 " (count selected) " block(s) re-selected"))))
-
-(defn link-blocks!
-  "Create block references ((uid)) at a target location without moving the originals.
-   source-str: comma-separated labels of blocks to reference
-   target: {:label \"D\"}, {:uid \"abc123\"}, {:page \"Title\"},
-           {:before \"B\"}, or {:after \"B\"}
-   order: \"first\" or \"last\" (default \"last\", ignored for before/after)"
-  [graph state source-str target order]
-  (let [{:keys [resolved]} (resolve-labels graph state source-str)
-        tgt (resolve-target graph state target order)]
-    (when (seq resolved)
-      (let [tgt-text (or (get-block-string graph (:uid tgt)) "")]
-        (println (str "🔗 Linking " (count resolved) " block(s) → " (:name tgt)))
-        (println (str "   target: \"" tgt-text "\"")))
-      (doseq [[idx {:keys [label uid text]}] (map-indexed vector resolved)]
-        (let [effective-order (if (number? (:order tgt))
-                                (+ (:order tgt) idx)
-                                (:order tgt))]
-          (roam-api graph "data.block.create"
-                    {"location" {"parent-uid" (:uid tgt) "order" effective-order}
-                     "block"    {"string" (str "((" uid "))")}})
-          (println (str "   🔗 " label " → ((" uid ")) created"))
-          (println (str "      \"" text "\"")))))))
-
-(defn link-selected!
-  "Create block references ((uid)) at a target for currently selected blocks.
-   The originals stay in place. Inverse of move-selected! --alias.
-   target: {:label \"D\"}, {:uid \"abc123\"}, {:page \"Title\"},
-           {:before \"B\"}, or {:after \"B\"}
-   order: \"first\" or \"last\" (default \"last\", ignored for before/after)"
-  [graph state target order]
-  (let [selected (:selected state)
-        tgt (resolve-target graph state target order)]
-
-    (when-not (seq selected)
-      (throw (ex-info "No blocks currently selected. Use --select first." {})))
-
-    (let [tgt-text (or (get-block-string graph (:uid tgt)) "")]
-      (println (str "🔗 Linking " (count selected) " selected block(s) → " (:name tgt)))
-      (println (str "   target: \"" tgt-text "\"")))
-
-    (doseq [[idx uid] (map-indexed vector selected)]
-      (let [effective-order (if (number? (:order tgt))
-                              (+ (:order tgt) idx)
-                              (:order tgt))
-            text (or (get-block-string graph uid) "")]
-        (roam-api graph "data.block.create"
-                  {"location" {"parent-uid" (:uid tgt) "order" effective-order}
-                   "block"    {"string" (str "((" uid "))")}})
-        (println (str "   🔗 ((" uid ")) created"))
-        (println (str "      \"" text "\""))))))
 
 (defn delete-blocks!
   "Delete block(s) by label. Accepts comma-separated labels.
@@ -709,13 +684,16 @@
    :reorder {:desc "Move block(s) to first/last within current parent"}
    :link    {:desc "Create block reference ((uid)) at target, original stays in place"}
    :link-selected {:desc "Create refs for selected blocks at target" :coerce :boolean}
+   :link-uid {:desc "Create ref for block by UID at target"}
    :move    {:desc "Move block(s) by label (comma-separated)"}
    :move-selected {:desc "Move currently selected blocks" :coerce :boolean}
+   :source-uid {:desc "Source block by UID (alternative to --move labels)"}
    :to      {:desc "Target parent block label for --move/--move-selected"}
    :ref     {:desc "Target parent block UID for --move/--move-selected"}
    :page    {:desc "Target page by title for --move/--move-selected"}
    :before  {:desc "Move before this label (sibling placement)"}
    :after   {:desc "Move after this label (sibling placement)"}
+   :pos     {:desc "Position: first, last, before, after (modifies --to target)"}
    :alias   {:desc "Leave a block reference ((uid)) at the original location" :coerce :boolean}
    :first   {:desc "Insert as first child (default: last)" :coerce :boolean}
    :last    {:desc "Insert as last child" :coerce :boolean}
@@ -724,14 +702,28 @@
    :scope   {:desc "Nav scope: main|sidebar|all" :default "all"}})
 
 (let [opts    (cli/parse-opts *command-line-args* {:spec cli-spec})
-      {:keys [graph on off labels label select scope move to delete ref page reorder before after fold unfold zoom link]} opts
-      move-order (if (:first opts) "first" "last")
+      {:keys [graph on off labels label select scope move to delete ref page reorder before after fold unfold zoom link pos]} opts
+      ;; --pos modifies how --to is interpreted:
+      ;;   --to D --pos before → sibling before D
+      ;;   --to D --pos after  → sibling after D
+      ;;   --to D --pos first  → first child of D
+      ;;   --to D --pos last   → last child of D (same as default)
+      move-order (cond
+                   (= pos "first") "first"
+                   (= pos "last")  "last"
+                   (:first opts)   "first"
+                   :else           "last")
       move-target (cond
-                    to   {:label (str/upper-case (str/trim to))}
-                    (not-empty ref)    {:uid (str/trim ref)}
-                    (not-empty page)   {:page (str/trim page)}
-                    (not-empty before) {:before (str/upper-case (str/trim before))}
-                    (not-empty after)  {:after (str/upper-case (str/trim after))}
+                    ;; --to combined with --pos before/after → sibling placement
+                    (and to (= pos "before")) {:before (str/upper-case (str/trim to))}
+                    (and to (= pos "after"))  {:after (str/upper-case (str/trim to))}
+                    ;; --to alone or with --pos first/last → child placement
+                    to                        {:label (str/upper-case (str/trim to))}
+                    (not-empty ref)           {:uid (str/trim ref)}
+                    (not-empty page)          {:page (str/trim page)}
+                    ;; standalone --before/--after (backward compat)
+                    (not-empty before)        {:before (str/upper-case (str/trim before))}
+                    (not-empty after)         {:after (str/upper-case (str/trim after))}
                     :else nil)
       ;; -s and --sidebar are aliases; -s takes priority
       ;; value can be: true (bare flag), or a number string
@@ -790,25 +782,41 @@
       unfold (fold! graph (ensure-labels! graph commands-uid state-uid scope) unfold true)
       reorder (reorder! graph (ensure-labels! graph commands-uid state-uid scope)
                         reorder move-order)
+      ;; ── Move / Link dispatch (unified via do-move! / do-link!) ─────
+      ;; Source can be: --move <labels>, --move-selected, or --source-uid <uid>
+      ;; All share the same target resolution (--to, --ref, --page, --pos)
       link   (if-not move-target
                (println "⚠️  --link requires --to <label>, --ref <uid>, or --page <title>")
-               (link-blocks! graph (ensure-labels! graph commands-uid state-uid scope)
-                             link move-target move-order))
+               (do-link! graph (ensure-labels! graph commands-uid state-uid scope)
+                         {:labels link} move-target move-order))
       (:link-selected opts)
              (if-not move-target
                (println "⚠️  --link-selected requires --to <label>, --ref <uid>, or --page <title>")
-               (link-selected! graph (ensure-labels! graph commands-uid state-uid scope)
-                               move-target move-order))
+               (let [state (ensure-labels! graph commands-uid state-uid scope)]
+                 (when-not (seq (:selected state))
+                   (throw (ex-info "No blocks currently selected. Use --select first." {})))
+                 (do-link! graph state {:selected (:selected state)}
+                           move-target move-order)))
+      (:link-uid opts)
+             (if-not move-target
+               (println "⚠️  --link-uid requires --to <label>, --ref <uid>, or --page <title>")
+               (do-link! graph (ensure-labels! graph commands-uid state-uid scope)
+                         {:source-uid (:link-uid opts)} move-target move-order))
       move   (if-not move-target
                (println "⚠️  --move requires --to <label>, --ref <uid>, or --page <title>")
-               (move-blocks! graph (ensure-labels! graph commands-uid state-uid scope)
-                             move move-target move-order (:alias opts)))
+               (do-move! graph (ensure-labels! graph commands-uid state-uid scope)
+                         {:labels move} move-target move-order (:alias opts)))
+      (:source-uid opts)
+             (if-not move-target
+               (println "⚠️  --source-uid requires --to <label>, --ref <uid>, or --page <title>")
+               (do-move! graph (ensure-labels! graph commands-uid state-uid scope)
+                         {:source-uid (:source-uid opts)} move-target move-order (:alias opts)))
       (:move-selected opts)
              (if-not move-target
                (println "⚠️  --move-selected requires --to <label>, --ref <uid>, or --page <title>")
-               (move-selected! graph commands-uid
-                               (ensure-labels! graph commands-uid state-uid scope)
-                               move-target move-order (:alias opts)))
+               (do-move-selected! graph commands-uid
+                                  (ensure-labels! graph commands-uid state-uid scope)
+                                  move-target move-order (:alias opts)))
       label  (act-on-label! graph (ensure-labels! graph commands-uid state-uid scope) label)
       :else  (do (println "Usage:")
                  (println "  bb bridge --on              # turn on nav labels")
@@ -845,9 +853,11 @@
                  (println "  bb bridge --move A --to D       # move under label D (last child)")
                  (println "  bb bridge --move A --ref uid    # move under block UID")
                  (println "  bb bridge --move A --page 'P'   # move to top-level of page P")
-                 (println "  bb bridge --move A --before B   # move A before sibling B")
-                 (println "  bb bridge --move A --after B    # move A after sibling B")
-                 (println "  bb bridge --move A --to D --first # as first child")
+                 (println "  bb bridge --move A --to D --pos first  # as first child")
+                 (println "  bb bridge --move A --to D --pos before # sibling before D")
+                 (println "  bb bridge --move A --to D --pos after  # sibling after D")
+                 (println "  bb bridge --move A --before B   # move A before sibling B (legacy)")
+                 (println "  bb bridge --move A --after B    # move A after sibling B (legacy)")
                  (println "  bb bridge --move A --to D --alias # move + leave ((uid)) at original")
                  (println "  bb bridge --move-selected --to D  # move selected blocks")
                  (println "  bb bridge --link A --to D       # create ((uid)) ref at D, A stays")
