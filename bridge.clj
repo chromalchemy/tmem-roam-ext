@@ -508,11 +508,16 @@
   (let [{:keys [graph commands-uid state]} (ctx)
         current    (get-current-selection graph commands-uid)
         new-uids   (keep #(resolve-uid state %) labels)
-        combined   (vec (distinct (concat current new-uids)))]
+        combined   (vec (distinct (concat current new-uids)))
+        in-sidebar? (= "sidebar" (resolve-label-region state (first labels)))
+        wid (if in-sidebar?
+              (let [sw (find-sidebar-windows graph state (first new-uids))]
+                (if (seq sw) (first sw) "main-window"))
+              "main-window")]
     (when (seq new-uids)
       (send-command! graph commands-uid
         (str "sel-" (System/currentTimeMillis)) "select-block"
-        {:uids combined :window_id "main-window" :mode "focus"})
+        {:uids combined :window_id wid :mode "focus"})
       (println (str "🎯 Added " (count new-uids) " → " (count combined) " total selected")))))
 
 (defn select-remove!
@@ -521,12 +526,18 @@
   (let [{:keys [graph commands-uid state]} (ctx)
         current     (get-current-selection graph commands-uid)
         remove-uids (set (keep #(resolve-uid state %) labels))
-        remaining   (vec (remove remove-uids current))]
+        remaining   (vec (remove remove-uids current))
+        in-sidebar? (= "sidebar" (resolve-label-region state (first labels)))
+        wid (if in-sidebar?
+              (let [uid (first remove-uids)
+                    sw  (when uid (find-sidebar-windows graph state uid))]
+                (if (seq sw) (first sw) "main-window"))
+              "main-window")]
     (if (seq remaining)
       (do
         (send-command! graph commands-uid
           (str "sel-" (System/currentTimeMillis)) "select-block"
-          {:uids remaining :window_id "main-window" :mode "focus"})
+          {:uids remaining :window_id wid :mode "focus"})
         (println (str "🎯 Removed " (count remove-uids) " → " (count remaining) " remaining")))
       (do
         (send-command! graph commands-uid
