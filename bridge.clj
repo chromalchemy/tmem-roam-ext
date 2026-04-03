@@ -987,56 +987,63 @@
 
 (defn nudge!
   "Move a block in a relative direction within the outliner.
-   label: keyword label of block to move
+   label: keyword label, or nil to use focused/selected block.
    direction: :up, :down, :left-above, :left-below, :right, :right-below"
-  [label direction]
-  (let [{:keys [graph state]} (ctx)
-        uid (resolve-uid state label)]
-    (when-not uid
-      (throw (ex-info (str "Label " (name label) " not found") {})))
-    (let [parent   (get-parent-uid graph uid)
-          order    (get-block-order graph uid)
-          siblings (get-children-uids graph parent)
-          idx      (.indexOf siblings uid)]
-      (case direction
-        :up
-        (if (> idx 0)
-          (do (roam-move-block graph uid parent (dec order))
-              (println (str "⬆ " (name label) " moved up")))
-          (println (str "⚠️  " (name label) " already first")))
+  ([direction] (nudge! nil direction))
+  ([label direction]
+   (let [{:keys [graph commands-uid state]} (ctx)
+         uid (if label
+               (let [u (resolve-uid state label)]
+                 (when-not u
+                   (throw (ex-info (str "Label " (name label) " not found") {})))
+                 u)
+               (or (get-in state [:focused :block-uid])
+                   (first (get-current-selection graph commands-uid))
+                   (throw (ex-info "No block focused or selected" {}))))
+         block-name (or (some-> label name) uid)
+         parent   (get-parent-uid graph uid)
+           order    (get-block-order graph uid)
+           siblings (get-children-uids graph parent)
+           idx      (.indexOf siblings uid)]
+       (case direction
+         :up
+         (if (> idx 0)
+           (do (roam-move-block graph uid parent (dec order))
+               (println (str "⬆ " block-name " moved up")))
+           (println (str "⚠️  " block-name " already first")))
 
-        :down
-        (if (< idx (dec (count siblings)))
-          (do (roam-move-block graph uid parent (inc order))
-              (println (str "⬇ " (name label) " moved down")))
-          (println (str "⚠️  " (name label) " already last")))
+         :down
+         (if (< idx (dec (count siblings)))
+           (do (roam-move-block graph uid parent (inc order))
+               (println (str "⬇ " block-name " moved down")))
+           (println (str "⚠️  " block-name " already last")))
 
-        :left-above
-        (let [grandparent  (get-parent-uid graph parent)
-              parent-order (get-block-order graph parent)]
-          (when-not grandparent
-            (throw (ex-info "Cannot outdent — already at top level" {})))
-          (roam-move-block graph uid grandparent parent-order)
-          (println (str "⬅⬆ " (name label) " outdented before parent")))
+         :left-above
+         (let [grandparent  (get-parent-uid graph parent)
+               parent-order (get-block-order graph parent)]
+           (when-not grandparent
+             (throw (ex-info "Cannot outdent — already at top level" {})))
+           (roam-move-block graph uid grandparent parent-order)
+           (println (str "⬅⬆ " block-name " outdented before parent")))
 
-        :left-below
-        (let [grandparent  (get-parent-uid graph parent)
-              parent-order (get-block-order graph parent)]
-          (when-not grandparent
-            (throw (ex-info "Cannot outdent — already at top level" {})))
-          (roam-move-block graph uid grandparent (inc parent-order))
-          (println (str "⬅⬇ " (name label) " outdented after parent")))
+         :left-below
+         (let [grandparent  (get-parent-uid graph parent)
+               parent-order (get-block-order graph parent)]
+           (when-not grandparent
+             (throw (ex-info "Cannot outdent — already at top level" {})))
+           (roam-move-block graph uid grandparent (inc parent-order))
+           (println (str "⬅⬇ " block-name " outdented after parent")))
 
-        :right
-        (if (> idx 0)
-          (let [prev-uid (nth siblings (dec idx))]
-            (roam-move-block graph uid prev-uid "last")
-            (println (str "➡ " (name label) " indented under previous sibling")))
-          (println (str "⚠️  " (name label) " no previous sibling to indent under")))
+         :right
+         (if (> idx 0)
+           (let [prev-uid (nth siblings (dec idx))]
+             (roam-move-block graph uid prev-uid "last")
+             (println (str "➡ " block-name " indented under previous sibling")))
+           (println (str "⚠️  " block-name " no previous sibling to indent under")))
 
-        :right-below
-        (if (< idx (dec (count siblings)))
-          (let [next-uid (nth siblings (inc idx))]
-            (roam-move-block graph uid next-uid "first")
-            (println (str "➡⬇ " (name label) " indented under next sibling")))
-          (println (str "⚠️  " (name label) " no next sibling to indent under")))))))
+         :right-below
+         (if (< idx (dec (count siblings)))
+           (let [next-uid (nth siblings (inc idx))]
+             (roam-move-block graph uid next-uid "first")
+             (println (str "➡⬇ " block-name " indented under next sibling")))
+           (println (str "⚠️  " block-name " no next sibling to indent under"))))))
