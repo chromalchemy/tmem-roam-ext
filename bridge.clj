@@ -583,10 +583,45 @@
         (println (str "✅ " (get-in resp [:result :count]) " block(s) deleted"))))))
 
 
+(defn- ordinal-suffix [day]
+  (let [d (mod day 100)]
+    (cond
+      (<= 11 d 13) "th"
+      (= 1 (mod d 10)) "st"
+      (= 2 (mod d 10)) "nd"
+      (= 3 (mod d 10)) "rd"
+      :else "th")))
+
+(defn- roam-daily-title
+  "Convert a LocalDate to Roam's daily note page title.
+   e.g. 'April 3rd, 2026'"
+  [^java.time.LocalDate date]
+  (let [month (.getMonth date)
+        month-name (str/capitalize (str/lower-case (str month)))
+        day   (.getDayOfMonth date)
+        year  (.getYear date)]
+    (str month-name " " day (ordinal-suffix day) ", " year)))
+
+(defn- resolve-daily-title
+  "Resolve a daily keyword or date string to a Roam daily page title.
+   :today, :yesterday, :tomorrow, or 'MM-DD-YYYY' string."
+  [daily]
+  (let [today (java.time.LocalDate/now)]
+    (cond
+      (= daily :today)     (roam-daily-title today)
+      (= daily :yesterday) (roam-daily-title (.minusDays today 1))
+      (= daily :tomorrow)  (roam-daily-title (.plusDays today 1))
+      (string? daily)      (roam-daily-title
+                             (java.time.LocalDate/parse daily
+                               (java.time.format.DateTimeFormatter/ofPattern "MM-dd-yyyy")))
+      :else (throw (ex-info (str "Invalid :daily value: " daily) {})))))
+
 (defn zoom!
   "Zoom into a block or page. Accepts:
    keyword   — label, e.g. :A
-   map       — {:label :A}, {:uid \"abc\"}, {:page \"inbox\"}"
+   map       — {:label :A}, {:uid \"abc\"}, {:page \"inbox\"},
+               {:daily :today}, {:daily :yesterday}, {:daily :tomorrow},
+               {:daily \"04-03-2026\"}"
   [target]
   (let [{:keys [graph state]} (ctx)]
     (if (keyword? target)
@@ -599,7 +634,7 @@
         (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}})
         (println (str "🔎 " (name target) " → " uid)))
       ;; map target
-      (let [{:keys [label uid page]} target]
+      (let [{:keys [label uid page daily]} target]
         (cond
           label (let [resolved (resolve-uid state label)]
                   (when-not resolved
@@ -612,7 +647,13 @@
                   (when-not page-uid
                     (throw (ex-info (str "Page \"" page "\" not found") {})))
                   (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}})
-                  (println (str "🔎 → page " page))))))))
+                  (println (str "🔎 → page " page)))
+          daily (let [title    (resolve-daily-title daily)
+                      page-uid (get-page-uid graph title)]
+                  (when-not page-uid
+                    (throw (ex-info (str "Daily page \"" title "\" not found") {})))
+                  (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}})
+                  (println (str "🔎 → " title))))))))
 
 (defn zoom-parent!
   "Zoom into the parent of a block by label keyword."
