@@ -584,18 +584,35 @@
 
 
 (defn zoom!
-  "Zoom into a block by label keyword."
-  [label]
-  (let [{:keys [graph state]} (ctx)
-        uid (resolve-uid state label)]
-    (when-not uid
-      (throw (ex-info (str "Label " (name label) " not found")
-                      {:available (when-let [lbls (:labels state)]
-                                    (sort (map name (keys lbls))))})))
-    (let [text (or (get-block-string graph uid) "")]
-      (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}})
-      (println (str "🔎 " (name label) " → " uid " zoomed"))
-      (println (str "   \"" text "\"")))))
+  "Zoom into a block or page. Accepts:
+   keyword   — label, e.g. :A
+   map       — {:label :A}, {:uid \"abc\"}, {:page \"inbox\"}"
+  [target]
+  (let [{:keys [graph state]} (ctx)]
+    (if (keyword? target)
+      ;; keyword label shorthand
+      (let [uid (resolve-uid state target)]
+        (when-not uid
+          (throw (ex-info (str "Label " (name target) " not found")
+                          {:available (when-let [lbls (:labels state)]
+                                        (sort (map name (keys lbls))))})))
+        (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}})
+        (println (str "🔎 " (name target) " → " uid)))
+      ;; map target
+      (let [{:keys [label uid page]} target]
+        (cond
+          label (let [resolved (resolve-uid state label)]
+                  (when-not resolved
+                    (throw (ex-info (str "Label " (name label) " not found") {})))
+                  (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" resolved}})
+                  (println (str "🔎 " (name label) " → " resolved)))
+          uid   (do (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}})
+                    (println (str "🔎 → " uid)))
+          page  (let [page-uid (get-page-uid graph page)]
+                  (when-not page-uid
+                    (throw (ex-info (str "Page \"" page "\" not found") {})))
+                  (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}})
+                  (println (str "🔎 → page " page))))))))
 
 (defn zoom-parent!
   "Zoom into the parent of a block by label keyword."
