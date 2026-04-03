@@ -669,6 +669,30 @@
       (println (str "   📂 " label " → " uid " unfolded"))
       (println (str "      \"" text "\"")))))
 
+(defn fold-children!
+  "Fold (collapse) all children of a block by label."
+  [label]
+  (let [{:keys [graph state]} (ctx)
+        uid (resolve-uid state label)]
+    (when-not uid
+      (throw (ex-info (str "Label " (name label) " not found") {})))
+    (let [children (get-children-uids graph uid)]
+      (doseq [c children]
+        (roam-set-block-open graph c false))
+      (println (str "📁 Folded " (count children) " children of " (name label))))))
+
+(defn unfold-children!
+  "Unfold (expand) all children of a block by label."
+  [label]
+  (let [{:keys [graph state]} (ctx)
+        uid (resolve-uid state label)]
+    (when-not uid
+      (throw (ex-info (str "Label " (name label) " not found") {})))
+    (let [children (get-children-uids graph uid)]
+      (doseq [c children]
+        (roam-set-block-open graph c true))
+      (println (str "📂 Unfolded " (count children) " children of " (name label))))))
+
 (defn open-sidebar!
   "Open a block by label keyword in the right sidebar."
   [label]
