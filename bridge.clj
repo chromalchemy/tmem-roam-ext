@@ -750,11 +750,13 @@
    Target (one required): :label :D, :uid \"uid\", :page \"title\"
    Options: :position :first/:last/:before/:after
             :action :move (default), :link, :alias"
-  [{:keys [labels source-uid selected label uid page position action]}]
-  (let [source (cond
-                 labels     {:labels labels}
-                 source-uid {:source-uid source-uid}
-                 selected   {:selected true})
+  [{:keys [labels source-uid selected label uid page position action parent]}]
+  (let [source (cond-> (cond
+                         labels     {:labels labels}
+                         source-uid {:source-uid source-uid}
+                         selected   {:selected true}
+                         parent     {})
+                 parent (assoc :parent true))
         target (cond
                  label {:label label}
                  uid   {:uid uid}
