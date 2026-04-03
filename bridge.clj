@@ -656,50 +656,41 @@
        :else (throw (ex-info (str "Invalid :daily value: " daily) {}))))))
 
 (defn zoom!
-  "Zoom into a block or page. Accepts:
-   keyword   — label, e.g. :A
-   map       — {:label :A}, {:uid \"abc\"}, {:page \"inbox\"},
-               {:daily :today}, {:daily :yesterday}, {:daily :tomorrow},
-               {:daily \"04-03-2026\"}"
-  [target]
-  (let [{:keys [graph state]} (ctx)]
-    (if (keyword? target)
-      ;; keyword label shorthand
-      (let [uid (resolve-uid state target)]
-        (when-not uid
-          (throw (ex-info (str "Label " (name target) " not found")
-                          {:available (when-let [lbls (:labels state)]
-                                        (sort (map name (keys lbls))))})))
-        (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}})
-        (println (str "🔎 " (name target) " → " uid)))
-      ;; map target
-      (let [{:keys [label uid page daily]} target]
-        (cond
-          label (let [resolved (resolve-uid state label)]
-                  (when-not resolved
-                    (throw (ex-info (str "Label " (name label) " not found") {})))
-                  (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" resolved}})
-                  (println (str "🔎 " (name label) " → " resolved)))
-          uid   (do (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}})
-                    (println (str "🔎 → " uid)))
-          page  (let [page-uid (get-page-uid graph page)]
-                  (when-not page-uid
-                    (throw (ex-info (str "Page \"" page "\" not found") {})))
-                  (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}})
-                  (println (str "🔎 → page " page)))
-          daily (let [;; For integer offsets, use current page as base if it's a DNP
-                      base (when (integer? daily)
-                             (let [state-uid (:state-uid (-bridge graph))
-                                   cur-state (read-state graph state-uid)
-                                   cur-title (get-in cur-state [:main :title])]
-                               (when cur-title (parse-roam-daily-title cur-title))))
-                      date  (resolve-daily-date daily base)
-                      title (roam-daily-title date)
-                      page-uid (get-page-uid graph title)]
-                  (when-not page-uid
-                    (throw (ex-info (str "Daily page \"" title "\" not found") {})))
-                  (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}})
-                  (println (str "🔎 → " title))))))))
+  "Zoom into a block or page.
+   (zoom! :A)              — label shorthand
+   (zoom! :label :A)       — by hat label
+   (zoom! :uid \"abc\")    — by block UID
+   (zoom! :page \"inbox\") — by page name
+   (zoom! :daily :today)   — by daily note keyword
+   (zoom! :daily 3)        — relative days from current DNP"
+  ([target] (zoom! :label target))
+  ([key val]
+   (let [{:keys [graph state]} (ctx)]
+     (case key
+       :label (let [uid (resolve-uid state val)]
+                (when-not uid
+                  (throw (ex-info (str "Label " (name val) " not found") {})))
+                (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}})
+                (println (str "🔎 " (name val) " → " uid)))
+       :uid   (do (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" val}})
+                  (println (str "🔎 → " val)))
+       :page  (let [page-uid (get-page-uid graph val)]
+                (when-not page-uid
+                  (throw (ex-info (str "Page \"" val "\" not found") {})))
+                (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}})
+                (println (str "🔎 → page " val)))
+       :daily (let [base (when (integer? val)
+                           (let [state-uid (:state-uid (-bridge graph))
+                                 cur-state (read-state graph state-uid)
+                                 cur-title (get-in cur-state [:main :title])]
+                             (when cur-title (parse-roam-daily-title cur-title))))
+                    date  (resolve-daily-date val base)
+                    title (roam-daily-title date)
+                    page-uid (get-page-uid graph title)]
+                (when-not page-uid
+                  (throw (ex-info (str "Daily page \"" title "\" not found") {})))
+                (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}})
+                (println (str "🔎 → " title)))))))
 
 (defn zoom-parent!
   "Zoom into the parent of a block by label keyword."
@@ -779,33 +770,31 @@
       (println (str "📂 Unfolded " (count children) " children of " (name label))))))
 
 (defn open-sidebar!
-  "Open a block or page in the right sidebar. Accepts:
-   keyword — label, e.g. :A
-   map     — {:label :A}, {:uid \"abc\"}, {:page \"inbox\"}, {:daily :today}"
-  [target]
-  (let [{:keys [graph state]} (ctx)]
-    (if (keyword? target)
-      ;; keyword label shorthand
-      (let [uid (resolve-uid state target)]
-        (when-not uid
-          (throw (ex-info (str "Label " (name target) " not found") {})))
-        (roam-api graph "ui.rightSidebar.addWindow"
-                  {"window" {"type" "outline" "block-uid" uid}})
-        (println (str "📌 " (name target) " → " uid " opened in sidebar")))
-      ;; map target
-      (let [{:keys [label uid page daily]} target
-            page (or page (when daily (roam-daily-title (resolve-daily-date daily))))
-            resolved-uid (cond
-                           label (let [u (resolve-uid state label)]
-                                   (when-not u (throw (ex-info (str "Label " (name label) " not found") {})))
-                                   u)
-                           uid   uid
-                           page  (let [pu (get-page-uid graph page)]
-                                   (when-not pu (throw (ex-info (str "Page \"" page "\" not found") {})))
-                                   pu))]
-        (roam-api graph "ui.rightSidebar.addWindow"
-                  {"window" {"type" "outline" "block-uid" resolved-uid}})
-        (println (str "📌 " (or (some-> label name) page uid) " opened in sidebar"))))))
+  "Open a block or page in the right sidebar.
+   (open-sidebar! :A)              — label shorthand
+   (open-sidebar! :label :A)       — by hat label
+   (open-sidebar! :uid \"abc\")    — by block UID
+   (open-sidebar! :page \"inbox\") — by page name
+   (open-sidebar! :daily :today)   — by daily note"
+  ([target] (open-sidebar! :label target))
+  ([key val]
+   (let [{:keys [graph state]} (ctx)
+         page (if (= key :daily)
+                (roam-daily-title (resolve-daily-date val))
+                (when (= key :page) val))
+         key  (if page :page key)
+         val  (if page page val)
+         resolved-uid (case key
+                        :label (let [u (resolve-uid state val)]
+                                 (when-not u (throw (ex-info (str "Label " (name val) " not found") {})))
+                                 u)
+                        :uid   val
+                        :page  (let [pu (get-page-uid graph val)]
+                                 (when-not pu (throw (ex-info (str "Page \"" val "\" not found") {})))
+                                 pu))]
+     (roam-api graph "ui.rightSidebar.addWindow"
+               {"window" {"type" "outline" "block-uid" resolved-uid}})
+     (println (str "📌 " (or (when (= key :label) (name val)) val) " opened in sidebar")))))
 
 (defn new-block!
   "Create a new block on a page (or current page) and focus it.
