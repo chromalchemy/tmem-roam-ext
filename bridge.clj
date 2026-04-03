@@ -779,19 +779,33 @@
       (println (str "📂 Unfolded " (count children) " children of " (name label))))))
 
 (defn open-sidebar!
-  "Open a block by label keyword in the right sidebar."
-  [label]
-  (let [{:keys [graph state]} (ctx)
-        uid (resolve-uid state label)]
-    (when-not uid
-      (throw (ex-info (str "Label " (name label) " not found")
-                      {:available (when-let [lbls (:labels state)]
-                                    (sort (map name (keys lbls))))})))
-    (let [text (or (get-block-string graph uid) "")]
-      (roam-api graph "ui.rightSidebar.addWindow"
-                {"window" {"type" "outline" "block-uid" uid}})
-      (println (str "📌 " (name label) " → " uid " opened in sidebar"))
-      (println (str "   \"" text "\"")))))
+  "Open a block or page in the right sidebar. Accepts:
+   keyword — label, e.g. :A
+   map     — {:label :A}, {:uid \"abc\"}, {:page \"inbox\"}, {:daily :today}"
+  [target]
+  (let [{:keys [graph state]} (ctx)]
+    (if (keyword? target)
+      ;; keyword label shorthand
+      (let [uid (resolve-uid state target)]
+        (when-not uid
+          (throw (ex-info (str "Label " (name target) " not found") {})))
+        (roam-api graph "ui.rightSidebar.addWindow"
+                  {"window" {"type" "outline" "block-uid" uid}})
+        (println (str "📌 " (name target) " → " uid " opened in sidebar")))
+      ;; map target
+      (let [{:keys [label uid page daily]} target
+            page (or page (when daily (roam-daily-title (resolve-daily-date daily))))
+            resolved-uid (cond
+                           label (let [u (resolve-uid state label)]
+                                   (when-not u (throw (ex-info (str "Label " (name label) " not found") {})))
+                                   u)
+                           uid   uid
+                           page  (let [pu (get-page-uid graph page)]
+                                   (when-not pu (throw (ex-info (str "Page \"" page "\" not found") {})))
+                                   pu))]
+        (roam-api graph "ui.rightSidebar.addWindow"
+                  {"window" {"type" "outline" "block-uid" resolved-uid}})
+        (println (str "📌 " (or (some-> label name) page uid) " opened in sidebar"))))))
 
 (defn new-block!
   "Create a new block on a page (or current page) and focus it.
