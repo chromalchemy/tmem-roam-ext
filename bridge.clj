@@ -11,7 +11,9 @@
 (require '[babashka.http-client :as http]
          '[cheshire.core :as json]
          '[clojure.string :as str]
-         '[babashka.fs :as fs])
+         '[babashka.fs :as fs]
+         '[timing.core :as t]
+         '[timing.adjusters :as adj])
 
 ;; ── Config ───────────────────────────────────────────────────────────
 
@@ -592,18 +594,26 @@
       (= 3 (mod d 10)) "rd"
       :else "th")))
 
+(def ^:private month-names
+  ["January" "February" "March" "April" "May" "June"
+   "July" "August" "September" "October" "November" "December"])
+
+(defn- today-value
+  "Midnight ms-value for today."
+  []
+  (t/midnight (t/time->value (t/date))))
+
 (defn- roam-daily-title
-  "Convert a LocalDate to Roam's daily note page title.
+  "Convert a timing ms-value to Roam's daily note page title.
    e.g. 'April 3rd, 2026'"
-  [^java.time.LocalDate date]
-  (let [month (.getMonth date)
-        month-name (str/capitalize (str/lower-case (str month)))
-        day   (.getDayOfMonth date)
-        year  (.getYear date)]
+  [value]
+  (let [month-name (nth month-names (dec (t/month? value)))
+        day        (t/day-in-month? value)
+        year       (t/year? value)]
     (str month-name " " day (ordinal-suffix day) ", " year)))
 
 (defn- parse-roam-daily-title
-  "Parse a Roam daily page title to a LocalDate, or nil if not a DNP."
+  "Parse a Roam daily page title to a timing ms-value, or nil if not a DNP."
   [title]
   (when-let [[_ month day year] (re-matches #"(\w+)\s+(\d+)\w{2},\s+(\d{4})" (str title))]
     (let [month-num (case month
@@ -612,47 +622,40 @@
                       "September" 9 "October" 10 "November" 11 "December" 12
                       nil)]
       (when month-num
-        (java.time.LocalDate/of (Integer/parseInt year) month-num (Integer/parseInt day))))))
+        (t/time->value (t/date (Integer/parseInt year) month-num (Integer/parseInt day)))))))
 
+;; Day-of-week: timing uses 1=Monday..7=Sunday (ISO 8601)
 (def ^:private dow-map
-  {:next-mon java.time.DayOfWeek/MONDAY    :last-mon java.time.DayOfWeek/MONDAY
-   :next-tue java.time.DayOfWeek/TUESDAY   :last-tue java.time.DayOfWeek/TUESDAY
-   :next-wed java.time.DayOfWeek/WEDNESDAY :last-wed java.time.DayOfWeek/WEDNESDAY
-   :next-thu java.time.DayOfWeek/THURSDAY  :last-thu java.time.DayOfWeek/THURSDAY
-   :next-fri java.time.DayOfWeek/FRIDAY    :last-fri java.time.DayOfWeek/FRIDAY
-   :next-sat java.time.DayOfWeek/SATURDAY  :last-sat java.time.DayOfWeek/SATURDAY
-   :next-sun java.time.DayOfWeek/SUNDAY    :last-sun java.time.DayOfWeek/SUNDAY})
-
-(defn- next-dow [^java.time.LocalDate from ^java.time.DayOfWeek dow]
-  (let [ahead (mod (- (.getValue dow) (.getValue (.getDayOfWeek from))) 7)
-        ahead (if (zero? ahead) 7 ahead)]
-    (.plusDays from ahead)))
-
-(defn- last-dow [^java.time.LocalDate from ^java.time.DayOfWeek dow]
-  (let [back (mod (- (.getValue (.getDayOfWeek from)) (.getValue dow)) 7)
-        back (if (zero? back) 7 back)]
-    (.minusDays from back)))
+  {:next-mon 1 :last-mon 1
+   :next-tue 2 :last-tue 2
+   :next-wed 3 :last-wed 3
+   :next-thu 4 :last-thu 4
+   :next-fri 5 :last-fri 5
+   :next-sat 6 :last-sat 6
+   :next-sun 7 :last-sun 7})
 
 (defn- resolve-daily-date
-  "Resolve a daily value to a LocalDate.
+  "Resolve a daily value to a timing ms-value (midnight).
    Keywords:  :today :yesterday :tomorrow
    Day of week: :next-mon .. :next-sun, :last-mon .. :last-sun
    Integer:   N days relative to base-date (positive=forward, negative=back)
    String:    'MM-DD-YYYY' date format"
-  ([daily] (resolve-daily-date daily (java.time.LocalDate/now)))
+  ([daily] (resolve-daily-date daily (today-value)))
   ([daily base-date]
-   (let [today (java.time.LocalDate/now)]
+   (let [today (today-value)]
      (cond
        (= daily :today)     today
-       (= daily :yesterday) (.minusDays today 1)
-       (= daily :tomorrow)  (.plusDays today 1)
+       (= daily :yesterday) (- today (t/days 1))
+       (= daily :tomorrow)  (+ today (t/days 1))
        (and (keyword? daily) (str/starts-with? (name daily) "next-"))
-       (next-dow today (get dow-map daily))
+       (adj/next-day-of-week today (get dow-map daily))
        (and (keyword? daily) (str/starts-with? (name daily) "last-"))
-       (last-dow today (get dow-map daily))
-       (integer? daily) (.plusDays (or base-date today) daily)
-       (string? daily)  (java.time.LocalDate/parse daily
-                          (java.time.format.DateTimeFormatter/ofPattern "MM-dd-yyyy"))
+       (adj/previous-day-of-week today (get dow-map daily))
+       (integer? daily) (+ (or base-date today) (t/days daily))
+       (string? daily)  (let [[m d y] (str/split daily #"-")]
+                          (t/time->value (t/date (Integer/parseInt y)
+                                                 (Integer/parseInt m)
+                                                 (Integer/parseInt d))))
        :else (throw (ex-info (str "Invalid :daily value: " daily) {}))))))
 
 (defn zoom!
