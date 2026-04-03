@@ -1011,8 +1011,10 @@
                          (println (str "⬆ " block-name " moved up")))
                      (println (str "⚠️  " block-name " already first")))
        :down       (if (< idx (dec (count siblings)))
-                     (do (roam-move-block graph uid parent (inc order))
-                         (println (str "⬇ " block-name " moved down")))
+                     (let [next-uid (nth siblings (inc idx))]
+                       ;; Move next sibling to our position — pushes us down
+                       (roam-move-block graph next-uid parent order)
+                       (println (str "⬇ " block-name " moved down")))
                      (println (str "⚠️  " block-name " already last")))
        :left-above (let [gp (get-parent-uid graph parent)
                          po (get-block-order graph parent)]
