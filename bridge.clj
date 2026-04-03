@@ -131,22 +131,31 @@
     (when (>= i 60)
       (throw (ex-info "Bridge timeout" {:cmd-id cmd-id})))
     (Thread/sleep 50)
-    ;; Scoped query: only search children of the commands block
+    ;; Query for response, also grab command block uid for cleanup
     (let [rows (roam-q graph
-                 (str "[:find ?s :where
+                 (str "[:find ?s ?cmd-uid :where
                         [?p :block/uid \"" (esc-dq commands-uid) "\"]
                         [?p :block/children ?cmd]
+                        [?cmd :block/uid ?cmd-uid]
                         [?cmd :block/string ?cs]
                         [(clojure.string/includes? ?cs \"" (esc-dq cmd-id) "\")]
                         [?cmd :block/children ?r]
                         [?r :block/string ?s]]"))
-          resp (->> rows
-                    (map (fn [[s]] (try (json/parse-string s true)
-                                        (catch Exception _ nil))))
-                    (filter #(= (:id %) cmd-id))
-                    first)]
+          parsed (->> rows
+                      (map (fn [[s cmd-uid]]
+                             [(try (json/parse-string s true)
+                                   (catch Exception _ nil))
+                              cmd-uid]))
+                      (filter (fn [[r _]] (= (:id r) cmd-id)))
+                      first)
+          [resp cmd-uid] parsed]
       (if resp
         (do
+          ;; Clean up: delete the command block after getting response
+          (future
+            (try (roam-api graph "data.block.delete"
+                           {"block" {"uid" cmd-uid}})
+                 (catch Exception _)))
           (when (= (:status resp) "error")
             (throw (ex-info (str "Bridge error: " (get-in resp [:result :error]))
                             {:cmd-id cmd-id :resp resp})))
@@ -450,6 +459,20 @@
 ;; ── Public API ───────────────────────────────────────────────────────
 ;; All functions below are the intended call surface from Python/Talon.
 ;; Each handles its own setup via (ctx) or (-bridge).
+
+(defn gc!
+  "Delete all command blocks under __commands__ to clean up accumulated cruft."
+  []
+  (let [{:keys [graph commands-uid]} (-bridge default-graph)
+        children (roam-q graph
+                   (str "[:find ?uid :where
+                          [?p :block/uid \"" (esc-dq commands-uid) "\"]
+                          [?p :block/children ?c]
+                          [?c :block/uid ?uid]]"))
+        uids (mapv first children)]
+    (doseq [uid uids]
+      (roam-api graph "data.block.delete" {"block" {"uid" uid}}))
+    (println (str "🧹 Deleted " (count uids) " command blocks"))))
 
 (defn hats-on!
   "Turn on nav-mode labels."
