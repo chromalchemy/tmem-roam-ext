@@ -928,8 +928,10 @@
      No target = reorder within current parent (requires :position :first/:last)
    Options: :position :first/:last/:before/:after
             :action :move (default), :link, :alias"
-  [{:keys [labels source-uid selected label uid page position action parent]}]
-  (let [source (cond-> (cond
+  [{:keys [labels source-uid selected label uid page daily position action parent]}]
+  (let [;; Resolve :daily to a page title
+        page (or page (when daily (roam-daily-title (resolve-daily-date daily))))
+        source (cond-> (cond
                          labels     {:labels labels}
                          source-uid {:source-uid source-uid}
                          selected   {:selected true}
