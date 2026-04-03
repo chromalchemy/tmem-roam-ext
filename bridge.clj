@@ -634,24 +634,35 @@
    :next-sat 6 :last-sat 6
    :next-sun 7 :last-sun 7})
 
+(defn- current-dnp-value
+  "Get the timing ms-value of the currently viewed daily note page, or nil."
+  []
+  (let [{:keys [graph state-uid]} (-bridge default-graph)
+        state (read-state graph state-uid)
+        title (get-in state [:main :title])]
+    (when title (parse-roam-daily-title title))))
+
 (defn- resolve-daily-date
   "Resolve a daily value to a timing ms-value (midnight).
-   Keywords:  :today :yesterday :tomorrow
+   Keywords:  :today :yesterday :tomorrow :next-day :prev-day
    Day of week: :next-mon .. :next-sun, :last-mon .. :last-sun
-   Integer:   N days relative to base-date (positive=forward, negative=back)
+   Integer:   N days relative to current DNP (falls back to today)
    String:    'MM-DD-YYYY' date format"
-  ([daily] (resolve-daily-date daily (today-value)))
+  ([daily] (resolve-daily-date daily nil))
   ([daily base-date]
-   (let [today (today-value)]
+   (let [today (today-value)
+         base  (or base-date (current-dnp-value) today)]
      (cond
        (= daily :today)     today
        (= daily :yesterday) (- today (t/days 1))
        (= daily :tomorrow)  (+ today (t/days 1))
+       (= daily :next-day)  (+ base (t/days 1))
+       (= daily :prev-day)  (- base (t/days 1))
        (and (keyword? daily) (str/starts-with? (name daily) "next-"))
        (adj/next-day-of-week today (get dow-map daily))
        (and (keyword? daily) (str/starts-with? (name daily) "last-"))
        (adj/previous-day-of-week today (get dow-map daily))
-       (integer? daily) (+ (or base-date today) (t/days daily))
+       (integer? daily) (+ base (t/days daily))
        (string? daily)  (let [[m d y] (str/split daily #"-")]
                           (t/time->value (t/date (Integer/parseInt y)
                                                  (Integer/parseInt m)
