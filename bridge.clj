@@ -797,56 +797,101 @@
       (>= depth 50)          nil
       :else (recur (get-parent-uid graph cur) (conj path cur) (inc depth)))))
 
+(defn- swap-nested-positional!
+  "Positional nested swap for direct parent→child.
+   B bubbles up to A's spot, A sinks into B's old slot.
+   A's other children move under B, B's old children move under A.
+
+   Before: P > A > [X, B > [C, D], Y]
+   After:  P > B > [X, A > [C, D], Y]"
+  [graph anc-uid desc-uid anc-lbl desc-lbl]
+  (let [anc-parent    (get-parent-uid graph anc-uid)
+        anc-order     (get-block-order graph anc-uid)
+        desc-order    (get-block-order graph desc-uid)
+        anc-children  (get-children-uids graph anc-uid)
+        desc-children (get-children-uids graph desc-uid)]
+    ;; 1. Park B's children under A temporarily
+    (doseq [c desc-children]
+      (roam-move-block graph c anc-uid "last"))
+    ;; 2. Move B to A's position (B lifts out with no children)
+    (roam-move-block graph desc-uid anc-parent anc-order)
+    ;; 3. Move A under B at B's old order
+    (roam-move-block graph anc-uid desc-uid desc-order)
+    ;; 4. Move A's original non-B children from A to B at their original orders
+    (doseq [c anc-children]
+      (when (not= c desc-uid)
+        (roam-move-block graph c desc-uid (get-block-order graph c))))
+    (println (str "🔄 Swapped (nested-positional) " (name anc-lbl) " ↔ " (name desc-lbl)))))
+
+(defn- swap-nested-content!
+  "Content nested swap — blocks keep their tree positions,
+   strings and children are exchanged."
+  [graph anc-uid desc-uid anc-lbl desc-lbl text-a text-b]
+  (let [path-child    (last (ancestor-path graph anc-uid desc-uid))
+        anc-children  (get-children-uids graph anc-uid)
+        desc-children (get-children-uids graph desc-uid)]
+    (roam-update-block graph anc-uid text-b)
+    (roam-update-block graph desc-uid text-a)
+    (doseq [c anc-children]
+      (when (not= c path-child)
+        (roam-move-block graph c desc-uid "last")))
+    (doseq [c desc-children]
+      (roam-move-block graph c anc-uid "last"))
+    (println (str "🔄 Swapped (nested-content) " (name anc-lbl) " ↔ " (name desc-lbl)))
+    (println "   strings + children exchanged")))
+
 (defn swap-blocks!
   "Swap two blocks by label.
 
    Non-nested: swaps positions (each moves to the other's parent+order).
-   Nested: swaps strings and children. The ancestor keeps its tree position
-   but gets the descendant's content, and vice versa."
-  [label-a label-b]
-  (let [{:keys [graph state]} (ctx)
-        uid-a (resolve-uid state label-a)
-        uid-b (resolve-uid state label-b)]
-    (when-not (and uid-a uid-b)
-      (throw (ex-info (str "Label not found: "
-                           (when-not uid-a (name label-a))
-                           (when (and (not uid-a) (not uid-b)) ", ")
-                           (when-not uid-b (name label-b))) {})))
-    (let [text-a    (get-block-string graph uid-a)
-          text-b    (get-block-string graph uid-b)
-          path-a-b  (ancestor-path graph uid-a uid-b)
-          path-b-a  (ancestor-path graph uid-b uid-a)
-          nested?   (or path-a-b path-b-a)]
-      (if nested?
-        ;; ── Nested: swap strings + children ──────────────────────
-        (let [[anc-uid desc-uid anc-lbl desc-lbl path]
-              (if path-a-b
-                [uid-a uid-b label-a label-b path-a-b]
-                [uid-b uid-a label-b label-a path-b-a])
-              path-child    (last path)
-              anc-children  (get-children-uids graph anc-uid)
-              desc-children (get-children-uids graph desc-uid)]
-          (roam-update-block graph anc-uid text-b)
-          (roam-update-block graph desc-uid text-a)
-          (doseq [c anc-children]
-            (when (not= c path-child)
-              (roam-move-block graph c desc-uid "last")))
-          (doseq [c desc-children]
-            (roam-move-block graph c anc-uid "last"))
-          (println (str "🔄 Swapped (nested) " (name anc-lbl) " ↔ " (name desc-lbl)))
-          (println "   strings + children exchanged"))
-        ;; ── Non-nested: swap positions ───────────────────────────
-        (let [parent-a (get-parent-uid graph uid-a)
-              parent-b (get-parent-uid graph uid-b)
-              order-a  (get-block-order graph uid-a)
-              order-b  (get-block-order graph uid-b)]
-          (if (= parent-a parent-b)
-            (let [[u1 o1 u2 o2] (if (< order-a order-b)
-                                  [uid-a order-a uid-b order-b]
-                                  [uid-b order-b uid-a order-a])]
-              (roam-move-block graph u2 parent-a o1)
-              (roam-move-block graph u1 parent-a o2))
-            (do
-              (roam-move-block graph uid-a parent-b order-b)
-              (roam-move-block graph uid-b parent-a order-a)))
-          (println (str "🔄 Swapped " (name label-a) " ↔ " (name label-b))))))))
+   Nested direct parent→child: positional swap — descendant bubbles up,
+     ancestor sinks down. Use {:content true} for content-only swap.
+   Nested deep: content swap (strings + children exchanged)."
+  ([label-a label-b] (swap-blocks! label-a label-b {}))
+  ([label-a label-b {:keys [content]}]
+   (let [{:keys [graph state]} (ctx)
+         uid-a (resolve-uid state label-a)
+         uid-b (resolve-uid state label-b)]
+     (when-not (and uid-a uid-b)
+       (throw (ex-info (str "Label not found: "
+                            (when-not uid-a (name label-a))
+                            (when (and (not uid-a) (not uid-b)) ", ")
+                            (when-not uid-b (name label-b))) {})))
+     (let [text-a   (get-block-string graph uid-a)
+           text-b   (get-block-string graph uid-b)
+           path-a-b (ancestor-path graph uid-a uid-b)
+           path-b-a (ancestor-path graph uid-b uid-a)
+           nested?  (or path-a-b path-b-a)]
+       (cond
+         ;; ── Non-nested: swap positions ──────────────────────────
+         (not nested?)
+         (let [parent-a (get-parent-uid graph uid-a)
+               parent-b (get-parent-uid graph uid-b)
+               order-a  (get-block-order graph uid-a)
+               order-b  (get-block-order graph uid-b)]
+           (if (= parent-a parent-b)
+             (let [[u1 o1 u2 o2] (if (< order-a order-b)
+                                   [uid-a order-a uid-b order-b]
+                                   [uid-b order-b uid-a order-a])]
+               (roam-move-block graph u2 parent-a o1)
+               (roam-move-block graph u1 parent-a o2))
+             (do
+               (roam-move-block graph uid-a parent-b order-b)
+               (roam-move-block graph uid-b parent-a order-a)))
+           (println (str "🔄 Swapped " (name label-a) " ↔ " (name label-b))))
+
+         ;; ── Nested: content swap (explicit or deep nesting) ─────
+         (or content
+             ;; Deep nesting: more than 1 hop between them
+             (> (count (or path-a-b path-b-a)) 1))
+         (let [[anc desc al dl] (if path-a-b
+                                  [uid-a uid-b label-a label-b]
+                                  [uid-b uid-a label-b label-a])]
+           (swap-nested-content! graph anc desc al dl text-a text-b))
+
+         ;; ── Nested direct parent→child: positional swap ─────────
+         :else
+         (let [[anc desc al dl] (if path-a-b
+                                  [uid-a uid-b label-a label-b]
+                                  [uid-b uid-a label-b label-a])]
+           (swap-nested-positional! graph anc desc al dl)))))))
