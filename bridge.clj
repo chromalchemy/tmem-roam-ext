@@ -185,6 +185,13 @@
         v (get (:labels state) k)]
     (if (map? v) (:uid v) v)))
 
+(defn resolve-label-region
+  "Get the region (:main or :sidebar) for a label from state."
+  [state label]
+  (let [k (keyword (str/upper-case (name label)))
+        v (get (:labels state) k)]
+    (when (map? v) (:region v))))
+
 (defn resolve-labels
   "Resolve a vector of keyword labels to [{:label :uid :text}].
    Labels are case-insensitive keywords, e.g. [:A :b :NL]."
@@ -469,7 +476,10 @@
      (when (seq resolved)
        (let [uids (mapv :uid resolved)
              first-uid (first uids)
-             wid  (if sidebar
+             ;; Auto-detect sidebar from label region, or use explicit :sidebar opt
+             in-sidebar? (or sidebar
+                             (= "sidebar" (resolve-label-region state (first labels))))
+             wid  (if in-sidebar?
                     (let [sw (find-sidebar-windows graph state first-uid)
                           n  (if (number? sidebar) (dec sidebar) 0)]
                       (if (seq sw)
