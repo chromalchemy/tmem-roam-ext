@@ -1009,13 +1009,31 @@
        :up         (if (> idx 0)
                      (do (roam-move-block graph uid parent (dec order))
                          (println (str "⬆ " block-name " moved up")))
-                     (println (str "⚠️  " block-name " already first")))
+                     ;; First child — cross branch: move to parent's prev sibling as last child
+                     (let [grandparent (get-parent-uid graph parent)
+                           parent-siblings (when grandparent (get-children-uids graph grandparent))
+                           parent-idx (when parent-siblings (.indexOf parent-siblings parent))
+                           prev-parent (when (and parent-idx (> parent-idx 0))
+                                         (nth parent-siblings (dec parent-idx)))]
+                       (if prev-parent
+                         (do (roam-move-block graph uid prev-parent "last")
+                             (println (str "⬆ " block-name " moved up (cross-branch)")))
+                         (println (str "⚠️  " block-name " already first")))))
        :down       (if (< idx (dec (count siblings)))
                      (let [next-uid (nth siblings (inc idx))]
                        ;; Move next sibling to our position — pushes us down
                        (roam-move-block graph next-uid parent order)
                        (println (str "⬇ " block-name " moved down")))
-                     (println (str "⚠️  " block-name " already last")))
+                     ;; Last child — cross branch: move to parent's next sibling as first child
+                     (let [grandparent (get-parent-uid graph parent)
+                           parent-siblings (when grandparent (get-children-uids graph grandparent))
+                           parent-idx (when parent-siblings (.indexOf parent-siblings parent))
+                           next-parent (when (and parent-idx (< parent-idx (dec (count parent-siblings))))
+                                         (nth parent-siblings (inc parent-idx)))]
+                       (if next-parent
+                         (do (roam-move-block graph uid next-parent 0)
+                             (println (str "⬇ " block-name " moved down (cross-branch)")))
+                         (println (str "⚠️  " block-name " already last")))))
        :left-above (let [gp (get-parent-uid graph parent)
                          po (get-block-order graph parent)]
                      (when-not gp (throw (ex-info "Already at top level" {})))
