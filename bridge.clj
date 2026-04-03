@@ -582,25 +582,6 @@
           (println (str "      \"" text "\"")))
         (println (str "✅ " (get-in resp [:result :count]) " block(s) deleted"))))))
 
-(defn reorder!
-  "Move block(s) to first/last within their current parent.
-   labels: vector of keywords, e.g. [:A :B]
-   order: :first or :last"
-  ([labels] (reorder! labels :last))
-  ([labels order]
-   (let [{:keys [graph state]} (ctx)
-         order (name (or order :last))
-         {:keys [resolved]} (resolve-labels graph state labels)]
-     (doseq [{:keys [label uid text]} resolved]
-       (let [parent (get-parent-uid graph uid)]
-         (when-not parent
-           (throw (ex-info (str "Cannot find parent of block " label " (" uid ")") {})))
-         (roam-move-block graph uid parent order)
-         (println (str "   ✅ " label " → " uid " moved to " order))
-         (println (str "      \"" text "\"")))))))
-
-(comment
-  (reorder! [:C] :first))
 
 (defn zoom!
   "Zoom into a block by label keyword."
@@ -822,12 +803,25 @@
                source)]
      (do-link! graph state src target order))))
 
+(defn- reorder-uids!
+  "Move resolved source blocks to :first/:last within their current parent."
+  [graph source-uids order]
+  (let [order (name (or order :last))]
+    (doseq [{:keys [label uid text]} source-uids]
+      (let [parent (get-parent-uid graph uid)]
+        (when-not parent
+          (throw (ex-info (str "Cannot find parent of " (or label uid)) {})))
+        (roam-move-block graph uid parent order)
+        (println (str "   ✅ " (or (some-> label name) uid) " → " order))
+        (println (str "      \"" text "\""))))))
+
 (defn transfer!
-  "Unified move/link entry point for voice commands.
+  "Unified move/link/reorder entry point for voice commands.
    Single map with source + target + options.
 
    Source (one required): :labels [:A :B], :source-uid \"uid\", :selected true
-   Target (one required): :label :D, :uid \"uid\", :page \"title\"
+   Target (optional):     :label :D, :uid \"uid\", :page \"title\"
+     No target = reorder within current parent (requires :position :first/:last)
    Options: :position :first/:last/:before/:after
             :action :move (default), :link, :alias"
   [{:keys [labels source-uid selected label uid page position action parent]}]
@@ -837,22 +831,32 @@
                          selected   {:selected true}
                          parent     {})
                  parent (assoc :parent true))
-        target (cond
-                 label {:label label}
-                 uid   {:uid uid}
-                 page  {:page page})
-        ;; :before/:after positions rewrite the target key
-        target (if (#{:before :after} position)
-                  (let [[_k v] (first target)]
-                    {position v})
-                  target)
-        order  (when (#{:first :last} position) position)
-        opts   (cond-> {}
-                  order (assoc :order order)
-                  (= action :alias) (assoc :alias true))]
-    (if (= action :link)
-      (link! source target (select-keys opts [:order]))
-      (move! source target opts))))
+        has-target? (or label uid page)
+        target (when has-target?
+                 (cond
+                   label {:label label}
+                   uid   {:uid uid}
+                   page  {:page page}))]
+    (if has-target?
+      ;; ── Move/link to target ────────────────────────────────────
+      (let [;; :before/:after positions rewrite the target key
+            target (if (#{:before :after} position)
+                     (let [[_k v] (first target)]
+                       {position v})
+                     target)
+            order  (when (#{:first :last} position) position)
+            opts   (cond-> {}
+                     order (assoc :order order)
+                     (= action :alias) (assoc :alias true))]
+        (if (= action :link)
+          (link! source target (select-keys opts [:order]))
+          (move! source target opts)))
+      ;; ── No target: reorder within current parent ───────────────
+      (let [{:keys [graph state]} (ctx)
+            uids (resolve-source-uids graph state source)]
+        (when-not (#{:first :last} position)
+          (throw (ex-info "Reorder requires :position :first or :last" {:position position})))
+        (reorder-uids! graph uids position)))))
 
 (defn- ancestor-path
   "Return the chain of uids from descendant up to (but not including) ancestor.
