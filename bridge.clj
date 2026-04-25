@@ -700,11 +700,12 @@
                              (when cur-title (parse-roam-daily-title cur-title))))
                     date  (resolve-daily-date val base)
                     title (roam-daily-title date)
-                    page-uid (get-page-uid graph title)]
-                (when-not page-uid
-                  (throw (ex-info (str "Daily page \"" title "\" not found") {})))
-                (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" page-uid}})
+                    title (roam-daily-title date)]
+                (roam-api graph "ui.mainWindow.openPage" {"page" {"title" title}})
                 (println (str "🔎 → " title)))))))
+
+(comment
+  (zoom! :daily :today))
 
 (defn zoom-parent!
   "Zoom into the parent of a block by label keyword."
