@@ -9,17 +9,31 @@ after each phase completion.
 | A — Schema lock | ✅ done | 2026-04-25 | Wire shape locked at `version: 1`. |
 | B — Bridge.clj resolver spine | ✅ done | 2026-04-25 | `resolve-target`/`resolve-mark`/`apply-modifier` + `dispatch` w/ `setSelection`. |
 | C — Mark + modifier coverage | ✅ done | 2026-04-25 | All 9 mark kinds + pronouns + phrase. |
-| D — Action coverage by shape | ⏳ next | — | `remove`, `collapse`, `expand`, `zoom`, `openInSidebar`, `moveToTarget`, `linkToTarget`, `aliasMove`, `insertNewBlock`, `swap`, `swapContent`, `nudge`, etc. |
-| E — Talon surface | ⏳ later | — | `roam_target` / `roam_destination` captures + `user.roam_action`. |
-| F — Vocabulary externalisation | ⏳ later | — | CSV-driven action/scope/pronoun vocab. |
+| D — Action coverage by shape | ✅ done | 2026-04-26 | All 16 actions across 4 shapes. Legacy fns intact (Phase E re-points Talon). |
+| E — Talon surface | ✅ done | 2026-04-26 | `roam_mark`/`roam_modifier`/`roam_target`/`roam_destination` captures + `user.roam_action`/`_pair`/`_dest`/`_swap`/`_nudge` actions. `hats.talon` + `tree_edit.talon` migrated. |
+| F — Vocabulary externalisation | ⏳ next | — | CSV-driven action/scope/pronoun vocab; auto-add-on-missing-row. |
 | G — JS extension cleanup | ⏳ later | — | `version` enforcement + `labelsVersion` cache + drop `delete-blocks`/`get-view`. |
 | H — Embedded DSL | ⏳ optional | — | String-form subset for LLM path. |
 
 ---
 
-## Architectural pivot — daemon mode (highest-leverage open question)
+## Architectural pivot — daemon mode (deferred — pure latency knob)
 
-**Status:** considered, not yet executed. Worth deciding between Phase D and Phase E.
+**Status:** considered and deferred. Phase D shipped in the shell-per-
+command model. Phase E will too. Daemonize only when latency actually
+annoys, not preemptively.
+
+> **TL;DR for future sessions:** The daemon is a 5–10× speedup, nothing
+> else. It is **not** required for correctness, **not** unblocking any
+> phase, **not** changing the wire contract. The `/tmp` pronoun file
+> already bridges state across `bb` invocations. The Phase D dynamic
+> `*persist-pronouns?*` flag preserves the daemon path as a one-line
+> opt-in, but flipping it isn't urgent. Migration when it happens is
+> a one-line Talon change (`bb -e ...` → `clj-nrepl-eval --port ...`)
+> plus a `def` → `defonce` audit (~5 lines).
+
+The remainder of this section is preserved for reference but should
+**not** be acted on without explicit user direction.
 
 The current architecture shells out to `bb` for every voice command and
 treats process death as the cleanup step. This forces:
@@ -256,10 +270,10 @@ makes the daemon flip a one-liner.
 
 ### Code
 
-| File | Touched in | Surface (post-Phase C) |
+| File | Touched in | Surface (post-Phase D) |
 |---|---|---|
 | `src/agent-bridge.js` | A | `processCommand` validates envelope `version`. Missing → warn-and-continue (transitional grace). Mismatched → hard reject `unknown-version`. Otherwise unchanged from pre-A. |
-| `bridge.clj` | A, B, C | Legacy public API (`select!`, `move!`, `transfer!`, `swap-blocks!`, `nudge!`, etc.) **still works untouched**. New AST resolver + dispatch + `execute!` lives at the bottom of the file (after `nudge!`). The two surfaces coexist. |
+| `bridge.clj` | A, B, C, D | Legacy public API (`select!`, `move!`, `transfer!`, `swap-blocks!`, `nudge!`, etc.) **still works untouched**. New AST resolver + dispatch + `execute!` lives at the bottom of the file. ~2160 lines total (~480 added in Phase D). The two surfaces coexist. |
 | `probe.bb` | A | One-line update: emits `version: 1`. |
 
 ### What's NEW in `bridge.clj` (bottom of file, after `nudge!`)
@@ -269,7 +283,8 @@ makes the daemon flip a one-liner.
 
 ;; Pronoun persistence
 pronouns-file, load-pronouns, save-pronouns!,
-pronouns-cache (atom), get-pronouns, update-pronouns!
+pronouns-cache (atom), get-pronouns, update-pronouns!,
+*persist-pronouns?* (^:dynamic, default true; daemon-mode flips it false)
 
 ;; Resolver
 resolve-mark*    (defmulti, dispatch on :type string)
@@ -282,12 +297,37 @@ apply-modifiers  (private — folds modifier list)
 
 resolve-target   (defn — primitive | list | range | implicit)
 
-;; Dispatch
-dispatch         (defmulti — only "setSelection" implemented)
-update-pronouns-after!  (private hook called after dispatch)
-execute!         (PUBLIC entry point — takes the v1 envelope)
+;; ═══ Phase D: Implicit-slot + destination helpers ═══
 
-;; Helpers
+resolve-target-implicit       (per-action implicit fallback for target slot)
+resolve-source-implicit       (per-action implicit fallback for source slot)
+resolve-destination           (insertionMode + position → {:parent-uid :order …})
+resolve-destination-implicit  (per-action implicit fallback for destination slot)
+pick-window-id                (cursor :window-id > sidebar > main)
+
+src-uid-maps                  (uids → move-uids! shape)
+dest-tgt-shape                (resolved-dest → legacy move-uids! shape)
+swap-uids!                    (port of swap-blocks! body, takes uids)
+
+;; ═══ Phase D: Dispatch methods (16 total) ═══
+
+dispatch (defmulti):
+  setSelection  addToSelection  removeFromSelection
+  remove  collapse  expand  zoom  openInSidebar
+  getText  getRefs  nudge
+  moveToTarget  aliasMove  linkToTarget
+  insertNewBlock
+  swap  swapContent
+  :default → unknown-action
+
+update-pronouns-after!  (now prefers result :source-uids over AST re-resolve)
+execute!                (PUBLIC entry point — takes the v1 envelope)
+execute-from-file!      (Phase E PUBLIC entry — slurps JSON envelope from
+                         a /tmp file, calls execute!, deletes file on success.
+                         Avoids shell-quoting hell when Talon embeds payloads
+                         containing apostrophes or embedded quotes.)
+
+;; Helpers (legacy)
 err              (private — throw ex-info with :error code)
 ascend-n, collect-descendants, ascend-to-page, ascend-to-top-level
 pick-by-index    (negative index = from end)
@@ -322,13 +362,23 @@ uid + order) was renamed to `resolve-destination-legacy`. Two callers updated:
 `execute!` accepts the parsed map. Errors raised via `ex-info` with
 `(:error data)` matching schema §9 codes.
 
-### Implemented action surface (Phase C)
+### Implemented action surface (Phase D)
 
-Just one action: **`setSelection`**.
+All 16 actions across 4 shapes — full target/source/destination AST.
 
-It resolves the target to a uid vec and sends a `select-block` JS command.
-Same end-effect as the legacy `(select! [:A])`, but reached through the
-new AST path. The legacy fn is **not** modified — both work.
+| Shape | Actions |
+|---|---|
+| Single-target (§5.1) | `setSelection` ✅ • `addToSelection` ✅ • `removeFromSelection` ✅ • `remove` ✅ • `collapse` ✅ • `expand` ✅ • `zoom` ✅ • `openInSidebar` ✅ • `getText` ✅ • `getRefs` ✅ • `nudge` ✅ |
+| Source+destination (§5.2) | `moveToTarget` ✅ • `linkToTarget` ✅ • `aliasMove` ✅ |
+| Destination-only (§5.3) | `insertNewBlock` ✅ |
+| Two-target (§5.4) | `swap` ✅ • `swapContent` ✅ |
+| Scope (§5.5) | not yet — `setNavMode`/`foldEveryAtDepth` (Phase E may not need) |
+| Pass-through (§5.6) | not yet — `executeRoamCommand`/`eval` (likely Phase G/H) |
+
+All legacy public fns (`select!`, `move!`, `transfer!`, `swap-blocks!`,
+…) **still work untouched**. Phase E re-points Talon to the new entry
+(✅ done as of 2026-04-26). Legacy fns can be deleted in Phase F or G
+once voice surface is fully verified by daily use.
 
 ### Implemented mark kinds (all 10 from schema §3)
 
@@ -370,8 +420,87 @@ new AST path. The legacy fn is **not** modified — both work.
 
 ## Verified live (against running Roam graph "tmem")
 
+### Phase E Talon surface (verified 2026-04-26 via simulated envelopes)
+
+Talon was not running during the session, so voice paths were verified
+by **simulating envelopes** that match what each new capture/action
+would produce, then dispatching through `execute-from-file!`. All green:
+
+| Spoken form | Envelope shape | Result |
+|---|---|---|
+| `take A` | setSelection + label | `{:uids [J58KBAAEZ] :count 1}` |
+| `take every child of A` | setSelection + label + every:child | `{:uids [...] :count 5}` |
+| `take parent of A` | setSelection + label + containing:parent | `{:uids [page-uid] :count 1}` |
+| `take that` | setSelection + that pronoun | resolves last result |
+| `zoom A` / `fold A` / `unfold A` | zoom/collapse/expand + label | each `{:uids [...] :count 1}` |
+| `new top child of A` | insertNewBlock + label + position:start | `{:uid "nb-..." :destination {...}}` |
+| `new block before C` | insertNewBlock + insertionMode:before + label | success + cleanup verified |
+| `move A to first` | moveToTarget + src=A + dest={parent of A, position:start} | reorder works |
+| `nudge A down` | nudge + label + direction | `{:uid ... :direction down}` |
+| insert→remove round-trip | insertNewBlock then remove | both succeed; pronoun roundtrip works |
+
+Voice-path verification (next session): a temporary `phase_e_smoke.talon`
+file was added with `phase smoke take/fold/unfold/zoom/insert/remove`
+rules. User speaks each phrase to confirm Talon-side capture parses
+match what bb-shell smoke confirmed. Delete the file once voice flow
+is confirmed stable.
+
+### Phase D actions (verified 2026-04-26)
+
+End-to-end tests, all green, against bridge with `hats-on!` (29
+labels) on graph `tmem`:
+
+```clojure
+;; Single-target read-only
+(execute! {... :action {:name "getText" :target {:type "primitive" :mark {:type "label" :value "A"}}}})
+;; → {:uids [...] :texts [{:uid "..." :string "..."}] :count 1}
+
+(execute! {... :action {:name "getRefs" :target {:type "primitive" :mark {:type "label" :value "A"}}}})
+;; → {:uids [...] :refs [{:uid "..." :string "..." :target "..."}] :count N}
+
+;; Single-target benign mutation (reversible)
+(execute! {... :action {:name "collapse" :target ...}})  ;; → {:uids [...] :count 1}
+(execute! {... :action {:name "expand"   :target ...}})
+(execute! {... :action {:name "zoom"     :target ...}})  ;; navigates main window
+(execute! {... :action {:name "openInSidebar" :target ...}}) ;; opens sidebar pane
+
+;; Selection mutation
+(execute! {... :action {:name "addToSelection"      :target ...}})  ;; combines with current
+(execute! {... :action {:name "removeFromSelection" :target ...}})  ;; subtracts
+
+;; Insert / move / alias / link / remove round-trip
+(let [r (execute! {... :action {:name "insertNewBlock" :string "test"
+                                :destination {:insertionMode "to"
+                                              :target {:type "primitive"
+                                                       :mark {:type "label" :value "A"}
+                                                       :modifiers [{:type "position" :at "end"}]}}}})
+      uid (:uid r)]
+  (execute! {... :action {:name "moveToTarget"
+                          :source {:type "primitive" :mark {:type "uid" :value uid}}
+                          :destination {:insertionMode "to"
+                                        :target {:type "primitive"
+                                                 :mark {:type "uid" :value "DEST"}
+                                                 :modifiers [{:type "position" :at "end"}]}}}})
+  ;; alternative: linkToTarget creates ((uid)) ref, aliasMove leaves alias behind
+  (execute! {... :action {:name "remove" :target {:type "primitive" :mark {:type "uid" :value uid}}}}))
+
+;; Two-target swap (sibling positions)
+(execute! {... :action {:name "swap"
+                        :target1 {:type "primitive" :mark {:type "uid" :value "A"}}
+                        :target2 {:type "primitive" :mark {:type "uid" :value "B"}}}})
+;; → {:uids [a b] :mode :swapped|:nested-content|:nested-positional :count 2}
+
+;; Pronoun round-trip across actions
+(execute! {... :action {:name "insertNewBlock" :string "x" :destination ...}})
+(execute! {... :action {:name "setSelection" :target {:type "primitive" :mark {:type "that"}}}}) ;; selects new block
+(execute! {... :action {:name "moveToTarget" :source ... :destination ...}})
+(execute! {... :action {:name "setSelection" :target {:type "primitive" :mark {:type "source"}}}}) ;; selects moved
+```
+
+### Phase B–C verifications (still passing)
+
 These all **pass** as of 2026-04-25 with bridge extension loaded and
-`hats-on!` active (9 labels):
+`hats-on!` active (29 labels):
 
 ```clojure
 ;; Single label
@@ -544,6 +673,95 @@ sure `moveToTarget`'s action map has a `:source` key.
 If you find yourself reaching for `def` or `defonce` to hold state in
 `bridge.clj`, **stop**. Use the file-mirror pattern (`pronouns-cache` +
 `load-pronouns` + `save-pronouns!` + `update-pronouns!`) as the model.
+**Phase D added** `^:dynamic *persist-pronouns?*` (default `true`) so
+the file-mirror is toggleable: in daemon mode (Phase E) flip it to
+`false` and the atom alone is the source of truth, with periodic /
+shutdown snapshots.
+
+### 9. `:source` pronoun must be captured **pre-action**
+
+The `update-pronouns-after!` hook used to silently re-resolve the
+action's `:source` AST after dispatch. That fails for modifier-based
+sources — `{:every :child of B}` resolves to *current* children of B,
+which post-`moveToTarget` is no longer the moved blocks.
+
+**Phase D fix:** dispatch methods for `moveToTarget`/`linkToTarget`/
+`aliasMove` capture source uids *pre-action* and return them in the
+result map under `:source-uids`. `update-pronouns-after!` now prefers
+that captured value, falling back to AST re-resolve only for stable
+mark types (label / uid). Schema §8 update rules now match
+implementation: "source uids (resolved pre-action)".
+
+### 10. Stale labels in `__state__` (testing gotcha)
+
+While verifying Phase D's destructive actions (move, alias, remove),
+saw label `B` resolve to a deleted prior test block (`nb-3545cc89-`).
+Root cause: nav-mode auto-relabels visible blocks, but a freshly-
+deleted block's label entry can persist in `__state__` until the next
+JS poll. Workaround for testing: use `uid` marks (which always pass
+through unchanged) when round-tripping through insert → mutate →
+remove. Production voice flow doesn't hit this because labels stay
+fresh between utterances.
+
+### 11. `swapContent` on non-nested = position swap (legacy semantics)
+
+`swap-blocks!` only honours the `:content` flag for **nested** pairs
+(parent-child or deeper). For sibling pairs, both `swap` and
+`swapContent` perform a position swap. Schema §5.4 says swapContent
+"swaps the two blocks' string content (children stay put)" without
+qualifying nested-only. Phase D dispatch matches legacy. If the schema
+needs to diverge, add a sibling-content branch in `swap-uids!`.
+
+### 13. Phase E: Talon `roam_target` modifier order is reversed for AST
+
+Spoken form reads outside-in: "parent of every child of A". The AST
+modifier list applies left-to-right against the mark, so it reads
+inside-out: `[{every:child}, {containing:parent}]` with `mark=A`.
+
+The `roam_target` Talon capture **collects modifiers in spoken order
+then `list(reversed(...))`** to produce the AST list. If you add a new
+modifier or change capture grammar, preserve this reversal — bridge.clj's
+resolver applies modifiers strictly left-to-right starting from the
+mark's region.
+
+### 14. Phase E: cursor-anchored destinations need fresh `__state__`
+
+`(insert | new) top block` produces an envelope with target =
+`{cursor + containing:page + position:start}`. If `__state__.focused.block-uid`
+points to a deleted/stale uid (e.g. immediately after running automated
+tests that just deleted blocks), `containing:page` may fail to resolve a
+parent UID and the create-block call errors with `"Parent entity doesn't
+exist"`.
+
+In real voice flow this isn't a problem — the JS extension polls every
+~2s and the user has multi-second gaps between voice commands. For
+automated CI / smoke tests, prefer label-anchored destinations
+(`{label:A + position:start}`) over cursor-anchored ones.
+
+### 15. Phase E: legacy `roam_action` Talon list renamed
+
+The Talon list `roam_action` (move/link/alias verb keywords for the old
+`transfer!` Clojure fn) was renamed to `roam_transfer_verb` in Phase E
+to free the name for the new Python action `user.roam_action(name, target)`.
+The legacy Clojure `transfer!` fn itself is **untouched**; only the Talon
+list and capture were renamed.
+
+### 16. Phase E: `roam_destination` capture replaces a legacy capture
+
+The legacy `roam_destination` Talon capture (which returned a Clojure
+kv-string fragment like `:label :A` or `:page "Tasks"`) was renamed to
+`roam_destination_legacy` and is **no longer wired into any active
+Talon rule**. The new `roam_destination` capture returns a Python dict
+matching the schema §6 destination AST. The legacy capture lingers in
+`roam_tmem_ext.py` as dead code — safe to delete in Phase F.
+
+### 12. `insertNewBlock` order coercion
+
+Schema destination §6 produces `{:order 0 | "last"}`. Roam's
+`data.block.create` API accepts either int or `"last"` string.
+`insertNewBlock` dispatches both correctly via a small `cond` inside
+the method. Don't try to send `:first`/`:last` keywords to the API —
+they're internal to legacy `create-and-focus-block!`.
 
 ---
 
@@ -556,100 +774,136 @@ M  bridge.clj                   (Phase A: send-command! version=1)
                                           + ~290 lines new resolver/dispatch at bottom)
                                 (Phase C: ~150 lines added — pronouns, mark coverage,
                                           ctx threading, update hook)
+                                (Phase D: ~480 lines added — implicit/destination
+                                          helpers, 16 dispatch methods, swap-uids!,
+                                          *persist-pronouns?*, pronoun-after upgrade)
+                                (Phase E: ~15 lines added — execute-from-file! helper)
 M  probe.bb                     (Phase A: version=1)
 A  docs/COMMAND-SCHEMA.md       (Phase A: ~400 lines)
 M  docs/COMMAND-SCHEMA.md       (Phase C: phrase case-sensitivity note,
                                           pronouns persistence section)
 A  docs/REFACTOR-PROGRESS.md    (this file)
+
+# Phase E (Talon side, in /Users/ryan/.talon/user/ryan/roam/)
+M  roam_tmem_ext.py             (renamed roam_action list → roam_transfer_verb,
+                                 renamed roam_destination capture → _legacy,
+                                 added ~140 lines: roam_pronoun/insertion_mode/
+                                 containing/every/ordinal/position lists, mark/
+                                 modifier/target/destination captures, 5 Python
+                                 actions: roam_action, roam_action_pair,
+                                 roam_action_dest, roam_swap, roam_nudge, plus
+                                 _write_envelope/_execute_envelope helpers)
+M  hats.talon                   (rewrote 30+ rules across select/fold/zoom/sidebar/
+                                 transfer/swap/nudge/delete sections to use
+                                 user.roam_action(name, target) and friends.
+                                 Legacy edit-mode rules preserved; legacy bridge
+                                 utility rules (hats-on!/hats-off!) unchanged.)
+M  tree_edit.talon              (12 new-block roam_fn rules → 12 inline-dict
+                                 rules calling user.roam_action_dest. Spoken
+                                 forms preserved; only the wire layer changed.)
+A  phase_e_smoke.talon          (temporary — voice-test rules for new captures.
+                                 Delete after voice flow confirmed.)
 ```
+
+`bridge.clj` end-state: ~2175 lines.
 
 No git commits yet. Working tree dirty. Run `git status` / `git diff` to
 see all changes.
 
 ---
 
-## How to pick up Phase D
+## How to pick up Phase F
 
 ### Pre-flight checklist
 
-1. **Read** `docs/COMPOSABLE-REFACTOR-PLAN.md` §7 Phase D (steps 9–12).
-2. **Read** `docs/COMMAND-SCHEMA.md` §5 (action shapes) and §7 (implicit
-   slot semantics).
-3. **Read** this file's "Important gotchas" §3 (destination flag) and
-   §7 (source pronoun auto-wires).
-4. **Confirm** the bridge is loaded in Roam:
+1. **Voice-verify Phase E first.** A `phase_e_smoke.talon` was added
+   with 8 test rules. Speak each in a Roam window with `hats-on!`
+   active. If anything fails, the wire is solid (verified via
+   `execute-from-file!`) so the issue is in Talon's capture grammar.
+   Common pitfalls:
+   - `<user.roam_target>` overlap with existing rules in tree_edit/
+     tree_select — mostly handled by Talon's specificity ranking, but
+     watch for "take block start" type collisions.
+   - The `(zoom | load) <user.roam_target>` rule may catch utterances
+     intended for `(zoom | load) (forward | next) day` if the day
+     vocabulary leaks into a target capture. Tested on smoke rules,
+     but daily-relative phrasing may need a shadowing fix.
+2. **Delete the smoke file** once voice flow is confirmed:
+   `rm /Users/ryan/.talon/user/ryan/roam/phase_e_smoke.talon`.
+3. **Read** `docs/COMPOSABLE-REFACTOR-PLAN.md` §7 Phase F (steps 19–20)
+   and §4 (CSV vocabulary externalisation).
+4. **Confirm bridge still works** (Phase E's
+   `execute-from-file!` is the new entry):
    ```bash
-   bb -e '(load-file "bridge.clj") (let [b (#'\''user/-bridge "tmem")] (println "labels:" (count (:labels (read-state (:graph b) (:state-uid b))))))'
-   ```
-   Should print a positive number. If 0, run `bb -e '(load-file "bridge.clj") (hats-on!)'` first.
-5. **Confirm** Phase B/C smoke test still works:
-   ```bash
-   bb -e '(load-file "bridge.clj") (execute! {:version 1 :id "preflight" :action {:name "setSelection" :target {:type "primitive" :mark {:type "label" :value "A"}}}})'
+   cat <<'EOF' > /tmp/roam-cmd-pf.json
+   {"version":1,"id":"preflight-F","action":{"name":"setSelection","target":{"type":"primitive","mark":{"type":"label","value":"A"}}}}
+   EOF
+   bb -e '(load-file "bridge.clj") (println (execute-from-file! "/tmp/roam-cmd-pf.json"))'
    ```
 
-### Phase D step ordering
+### Phase F step ordering
 
-Per the plan §7:
+Per the plan §7 steps 19–20:
 
-1. **Step 9 — single-target shape:** `remove`, `collapse`, `expand`,
-   `zoom`, `openInSidebar`, `getText`, `nudge`, `addToSelection`,
-   `removeFromSelection`, `getRefs`. Each is ~5 lines: resolve target,
-   call the existing `roam-*` helper, return result map.
-2. **Step 10 — source+dest shape:** `moveToTarget`, `linkToTarget`,
-   `aliasMove`. Reuse `move-uids!` and `link-uids!`. **`destination?`
-   flag must be true** when resolving the destination's target.
-   Implicit source = `selection` pronoun. Implicit destination = "stay
-   under current parent, end" (= reorder).
-3. **Step 11 — dest-only shape:** `insertNewBlock`. Replaces 5 legacy
-   fns. Reuse `create-and-focus-block!`.
-4. **Step 12 — two-target shape:** `swap`, `swapContent`. Reuse
-   `swap-blocks!` body.
+19. **Move vocabulary into CSV files.** Create three CSVs in the Talon
+    user dir (or a new `roam-vocabulary/` subdir):
+    - `roam-actions.csv` — spoken-form → action name (e.g. `chuck,remove`)
+    - `roam-scopes.csv` — spoken-form → scope-type ID
+    - `roam-pronouns.csv` — spoken-form → pronoun
 
-### Recommended pattern for each dispatch method
+    Currently every list value is hardcoded in `roam_tmem_ext.py`'s
+    `ctx.lists` blocks. The CSV approach mirrors Cursorless's pattern
+    of `cursorless-settings/*.csv` (already in
+    `/Users/ryan/.talon/user/cursorless-settings/`).
 
-```clojure
-(defmethod dispatch "remove"
-  [_ {:keys [target]} {:keys [graph commands-uid] :as ctx}]
-  (let [region (resolve-target ctx (or target {:type "implicit"}))
-        uids   (mapv :uid region)]
-    (when (empty? uids)
-      (err "missing-slot" {:action "remove" :reason "no uids resolved"}))
-    ;; Use existing send-command! to JS bridge for delete-blocks,
-    ;; OR call roam-api directly.
-    (send-command! graph commands-uid
-      (str "ex-rm-" (System/currentTimeMillis)) "delete-blocks"
-      {:uids uids})
-    {:uids uids :count (count uids)}))
-```
+20. **Write a CSV loader** that:
+    - Reads each CSV at module load time
+    - Populates the corresponding `ctx.lists["user.roam_*"]` dict
+    - Detects missing canonical rows on startup and auto-adds them
+      (Cursorless's "missing-line auto-add" trick — prevents accidental
+      vocabulary loss when the user edits the CSV)
+    - Reloads on file change (Talon already auto-reloads `.talon` files;
+      CSV reload is a watcher pattern)
 
-Each dispatch method:
-- Gets `target`/`source`/`destination` from action map
-- Falls back to `{:type "implicit"}` if absent (per schema §7 implicit
-  table)
-- Resolves via `resolve-target ctx ...` (or with `:destination? true`
-  for destinations)
-- Returns `{:uids [...] :count N ...}` so `update-pronouns-after!`
-  can mirror to `:that`/`:source` automatically.
+### Things to NOT do in Phase F
 
-### Things to NOT do in Phase D
+- **Don't delete legacy `bridge.clj` public fns yet.** Wait until daily
+  voice usage has confirmed every spoken-form variant works through the
+  new wire. Suggested sequence: live-use Phase E for ≥1 week, then in
+  Phase F or G start removing `select!`, `move!`, `transfer!`,
+  `swap-blocks!`, `nudge!`, `new-*!`, `fold!`/`unfold!`,
+  `zoom!`/`zoom-parent!`/`zoom-out!`, `delete!`, `open-sidebar!` (~25 fns).
+- **Don't touch `processCommand` in `agent-bridge.js`** — Phase G.
+- **Don't add new actions / marks / modifiers** — Phase D is action-
+  complete. Phase F is vocabulary-externalization only.
+- **Don't delete `phase_e_smoke.talon`** until voice-verified. It's the
+  fallback validation harness if voice flow regresses.
 
-- **Don't modify legacy public fns** (`select!`, `move!`, etc.) — they
-  stay until Phase E re-points Talon.
-- **Don't touch `processCommand` in `agent-bridge.js`** — that's Phase G.
-- **Don't add new mark/modifier types** — Phase C is feature-complete
-  for marks and modifiers.
-- **Don't write to `__state__.pronouns`** — JS will clobber. Phase G work.
+### Things to consider for Phase F
+
+- The legacy `roam_destination_legacy` capture and `roam_source` /
+  `roam_source_base` captures in `roam_tmem_ext.py` are dead code post-E
+  (no active rules call them, except `print source <user.roam_source>`
+  debug rule). Safe to delete during Phase F vocab externalisation.
+- The legacy bridge.clj public fns become deletion candidates once
+  Phase E voice flow is daily-verified. ~25 fns total. Ordering: delete
+  in groups, voice-test after each delete.
+- Daemon mode (deferred §) becomes worth revisiting if Phase F reveals
+  Talon-side latency annoyance.
 
 ---
 
-## Quick repo orientation (post-Phase C)
+## Quick repo orientation (post-Phase E)
 
 ```
 /Users/ryan/dev/tmem-roam-ext/
 ├── AGENT-BRIDGE.md              ← legacy command catalogue (JS side)
-├── bridge.clj                   ← bb script. ~1500 lines.
-│                                  Top: legacy public fns
-│                                  Bottom (~line 1170+): NEW Phase B+C resolver
+├── bridge.clj                   ← bb script. ~2175 lines.
+│                                  Top (line 1–1170): legacy public fns
+│                                  Bottom (~line 1170+): Phase B–D resolver
+│                                                        + 16 dispatch methods
+│                                  Bottom-most (~line 2117+): execute-from-file!
+│                                                        (Phase E entry point)
 ├── probe.bb                     ← scratch eval helper
 ├── src/agent-bridge.js          ← JS extension. version-check at top of processCommand.
 ├── extension.js                 ← built output (loaded by Roam)
@@ -658,6 +912,19 @@ Each dispatch method:
 │   ├── COMMAND-SCHEMA.md            ← Wire contract (Phase A)
 │   └── REFACTOR-PROGRESS.md         ← this file
 ├── /tmp/roam-bridge-pronouns-tmem.json  ← runtime pronoun state
+└── /tmp/roam-bridge-cmd-*.json          ← Phase E voice-command envelopes
+                                          (one per command, deleted post-execute)
+
+# Talon side (Phase E)
+/Users/ryan/.talon/user/ryan/roam/
+├── roam_tmem_ext.py             ← Phase E captures + Python actions
+├── hats.talon                   ← migrated: select/fold/zoom/sidebar/transfer/
+│                                  swap/nudge/delete via user.roam_action*
+├── tree_edit.talon              ← migrated: 12 new-block rules → roam_action_dest
+├── block_edit.talon             ← unchanged (text-editing within block, not
+│                                  action surface)
+├── phase_e_smoke.talon          ← TEMPORARY voice-verification harness
+└── (other .talon files)         ← unchanged (keystroke-only, no roam_fn calls)
 ```
 
 ### nREPL ports (as of session)
@@ -679,8 +946,11 @@ The bb ports may not be the same on next session — discover via
   `bridge.clj` ignores it entirely. Decide in Phase G when the JS-side
   cache is added.
 - **Reference / mention modifiers** (`every reference to A`, `every
-  block mentioning #tag`). Stubbed as `not-implemented` in Phase C.
-  Likely Phase D work since they need ref-traversal queries.
+  block mentioning #tag`). Stubbed as `not-implemented` in Phase C,
+  **still stubbed** post-Phase D since no Talon rule today requests
+  them. Add when E surfaces a spoken form for "every reference to A"
+  — `getRefs` action already does the underlying ref-traversal query
+  and can be lifted into a modifier in ~10 lines.
 - **Range UX:** if anchor/active resolve to multi-uid regions, we take
   `(first ar)`/`(first br)`. Document or generalise.
 - **Pronoun TTL:** no expiry — `:that` survives indefinitely. Probably
@@ -689,4 +959,4 @@ The bb ports may not be the same on next session — discover via
 
 ---
 
-*Last updated: 2026-04-25, end of Phase C.*
+*Last updated: 2026-04-26, end of Phase E.*

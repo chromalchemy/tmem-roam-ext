@@ -1225,10 +1225,17 @@
         (swap! pronouns-cache assoc graph p)
         p)))
 
+(def ^:dynamic *persist-pronouns?*
+  "If true (default), every update-pronouns! mirrors to the per-graph
+   /tmp JSON file. Daemon mode (Phase E) flips this to false: the atom
+   becomes the source of truth, with periodic / shutdown snapshots."
+  true)
+
 (defn- update-pronouns! [graph f]
   (let [updated (f (get-pronouns graph))]
     (swap! pronouns-cache assoc graph updated)
-    (save-pronouns! graph updated)
+    (when *persist-pronouns?*
+      (save-pronouns! graph updated))
     updated))
 
 ;; ── resolve-mark ─────────────────────────────────────────────────────────
@@ -1560,6 +1567,132 @@
                                     :reason "no selection or cursor"})))
     (err "unknown-target-type" {:target target})))
 
+;; ── Implicit-slot + destination helpers (Phase D) ───────────────────────
+;; Implements per-action defaults from docs/COMMAND-SCHEMA.md §7. Each
+;; action uses one of these instead of calling resolve-target directly,
+;; so the implicit-slot table is enforced uniformly.
+
+(defn- resolve-target-implicit
+  "Resolve target with §7 implicit fallback. action-name decides whether
+   missing target is an error (setSelection family) or falls back to
+   selection→cursor (implicit) or cursor (openInSidebar)."
+  [ctx target action-name]
+  (cond
+    target
+    (resolve-target ctx target)
+
+    ;; Per §7: setSelection/addToSelection/removeFromSelection MUST be explicit
+    (#{"setSelection" "addToSelection" "removeFromSelection"} action-name)
+    (err "missing-slot" {:action action-name :slot "target"
+                         :reason "must be explicit"})
+
+    ;; Per §7: openInSidebar implicit = cursor (not selection→cursor)
+    (= action-name "openInSidebar")
+    (resolve-mark ctx {:type "cursor"})
+
+    ;; All other single-target actions: implicit = selection → cursor
+    :else
+    (resolve-target ctx {:type "implicit"})))
+
+(defn- resolve-source-implicit
+  "Resolve source slot with §7 fallback.
+   moveToTarget/aliasMove → selection (then cursor via implicit)
+   linkToTarget          → that pronoun"
+  [ctx source action-name]
+  (cond
+    source (resolve-target ctx source)
+    (#{"moveToTarget" "aliasMove"} action-name)
+    (resolve-target ctx {:type "implicit"})
+    (= action-name "linkToTarget")
+    (resolve-mark ctx {:type "that"})
+    :else
+    (err "missing-slot" {:action action-name :slot "source"})))
+
+(defn- resolve-destination
+  "Resolve a destination AST to {:parent-uid :order :anchor-uid :target-uid}.
+   Schema §6:
+     insertionMode \"to\"     → insert as child; position modifier picks start/end
+     insertionMode \"before\" → sibling immediately before target
+     insertionMode \"after\"  → sibling immediately after target
+   The destination's target is resolved with :destination? true so the
+   position modifier becomes available."
+  [{:keys [graph] :as ctx} destination]
+  (when-not destination
+    (err "missing-slot" {:slot "destination"}))
+  (let [{:keys [insertionMode target]} destination
+        sub-ctx    (assoc ctx :destination? true)
+        region     (resolve-target sub-ctx target)
+        first-r    (first region)
+        target-uid (:uid first-r)
+        position   (:position first-r)] ; populated by position modifier
+    (when (nil? target-uid)
+      (err "missing-slot" {:slot "destination"
+                           :reason "destination resolved to no uid"}))
+    (case (or insertionMode "to")
+      "to"     {:parent-uid target-uid
+                :order      (case position
+                              "start" 0
+                              "end"   "last"
+                              ;; Default per §6 = end
+                              "last")
+                :target-uid target-uid}
+      "before" (let [parent (get-parent-uid graph target-uid)
+                     order  (get-block-order graph target-uid)]
+                 (when-not parent
+                   (err "missing-slot" {:slot "destination"
+                                        :reason "before/after at page level"}))
+                 {:parent-uid parent :order order
+                  :anchor-uid target-uid :target-uid target-uid})
+      "after"  (let [parent (get-parent-uid graph target-uid)
+                     order  (get-block-order graph target-uid)]
+                 (when-not parent
+                   (err "missing-slot" {:slot "destination"
+                                        :reason "before/after at page level"}))
+                 {:parent-uid parent :order (inc order)
+                  :anchor-uid target-uid :target-uid target-uid})
+      (err "unknown-insertion-mode" {:insertionMode insertionMode}))))
+
+(defn- resolve-destination-implicit
+  "Resolve destination with §7 fallback.
+   moveToTarget / aliasMove (no destination) → stay under current parent, end
+   linkToTarget / insertNewBlock / pasteBlock / pasteText → first child of cursor
+   The reorder fallback needs source-region to find the parent."
+  [{:keys [graph state] :as ctx} destination action-name source-region]
+  (cond
+    destination
+    (resolve-destination ctx destination)
+
+    (#{"moveToTarget" "aliasMove"} action-name)
+    (let [first-uid (some-> source-region first :uid)
+          parent    (when first-uid (get-parent-uid graph first-uid))]
+      (when-not parent
+        (err "missing-slot" {:action action-name
+                             :reason "implicit reorder needs a parent"}))
+      {:parent-uid parent :order "last"})
+
+    (#{"linkToTarget" "insertNewBlock" "pasteBlock" "pasteText"} action-name)
+    (let [cursor-uid (get-in state [:focused :block-uid])]
+      (when-not cursor-uid
+        (err "missing-slot" {:action action-name
+                             :reason "no destination and no cursor"}))
+      {:parent-uid cursor-uid :order 0 :target-uid cursor-uid})
+
+    :else
+    (err "missing-slot" {:action action-name :slot "destination"})))
+
+(defn- pick-window-id
+  "Pick a JS window-id for select-block / etc. Prefers the region's
+   :window-id (set by cursor mark) > sidebar window resolution > main."
+  [{:keys [graph state]} region]
+  (let [first-r     (first region)
+        explicit    (:window-id first-r)
+        in-sidebar? (some #(= "sidebar" (:region %)) region)]
+    (cond
+      explicit    explicit
+      in-sidebar? (let [sw (find-sidebar-windows graph state (:uid first-r))]
+                    (if (seq sw) (first sw) "main-window"))
+      :else       "main-window")))
+
 ;; ── dispatch + execute! ──────────────────────────────────────────────────
 
 (defmulti dispatch
@@ -1568,16 +1701,10 @@
   (fn [name _action _ctx] name))
 
 (defmethod dispatch "setSelection"
-  [_ {:keys [target]} {:keys [graph commands-uid state] :as ctx}]
-  (when-not target
-    (err "missing-slot" {:action "setSelection" :slot "target"}))
-  (let [region (resolve-target ctx target)
+  [_ {:keys [target]} {:keys [graph commands-uid] :as ctx}]
+  (let [region (resolve-target-implicit ctx target "setSelection")
         uids   (mapv :uid region)
-        in-sidebar? (some #(= "sidebar" (:region %)) region)
-        wid    (if in-sidebar?
-                 (let [sw (find-sidebar-windows graph state (first uids))]
-                   (if (seq sw) (first sw) "main-window"))
-                 "main-window")]
+        wid    (pick-window-id ctx region)]
     (when (empty? uids)
       (err "missing-slot" {:action "setSelection"
                            :reason "target resolved to no uids"}))
@@ -1586,6 +1713,352 @@
       "select-block"
       {:uids uids :window_id wid :mode "focus"})
     {:uids uids :window_id wid :count (count uids)}))
+
+(defmethod dispatch "addToSelection"
+  [_ {:keys [target]} {:keys [graph commands-uid] :as ctx}]
+  (let [region   (resolve-target-implicit ctx target "addToSelection")
+        new-uids (mapv :uid region)
+        current  (get-current-selection graph commands-uid)
+        combined (vec (distinct (concat current new-uids)))
+        wid      (pick-window-id ctx region)]
+    (when (empty? new-uids)
+      (err "missing-slot" {:action "addToSelection"
+                           :reason "target resolved to no uids"}))
+    (send-command! graph commands-uid
+      (str "ex-add-" (System/currentTimeMillis))
+      "select-block"
+      {:uids combined :window_id wid :mode "focus"})
+    {:uids combined :added new-uids :count (count combined)}))
+
+(defmethod dispatch "removeFromSelection"
+  [_ {:keys [target]} {:keys [graph commands-uid] :as ctx}]
+  (let [region    (resolve-target-implicit ctx target "removeFromSelection")
+        rm-uids   (set (mapv :uid region))
+        current   (get-current-selection graph commands-uid)
+        remaining (vec (remove rm-uids current))
+        wid       (pick-window-id ctx region)]
+    (when (empty? rm-uids)
+      (err "missing-slot" {:action "removeFromSelection"
+                           :reason "target resolved to no uids"}))
+    (if (seq remaining)
+      (send-command! graph commands-uid
+        (str "ex-rmsel-" (System/currentTimeMillis))
+        "select-block"
+        {:uids remaining :window_id wid :mode "focus"})
+      (send-command! graph commands-uid
+        (str "ex-clrsel-" (System/currentTimeMillis))
+        "clear-selection" {}))
+    {:uids remaining :removed (vec rm-uids) :count (count remaining)}))
+
+(defmethod dispatch "remove"
+  [_ {:keys [target]} {:keys [graph commands-uid] :as ctx}]
+  (let [region (resolve-target-implicit ctx target "remove")
+        uids   (mapv :uid region)]
+    (when (empty? uids)
+      (err "missing-slot" {:action "remove"
+                           :reason "target resolved to no uids"}))
+    (let [resp (send-command! graph commands-uid
+                 (str "ex-rm-" (System/currentTimeMillis))
+                 "delete-blocks" {:uids uids})]
+      {:uids uids
+       :deleted (or (get-in resp [:result :deleted]) uids)
+       :count (or (get-in resp [:result :count]) (count uids))})))
+
+(defmethod dispatch "collapse"
+  [_ {:keys [target]} {:keys [graph] :as ctx}]
+  (let [region (resolve-target-implicit ctx target "collapse")
+        uids   (mapv :uid region)]
+    (when (empty? uids)
+      (err "missing-slot" {:action "collapse"
+                           :reason "target resolved to no uids"}))
+    (doseq [uid uids]
+      (roam-set-block-open graph uid false))
+    {:uids uids :count (count uids)}))
+
+(defmethod dispatch "expand"
+  [_ {:keys [target]} {:keys [graph] :as ctx}]
+  (let [region (resolve-target-implicit ctx target "expand")
+        uids   (mapv :uid region)]
+    (when (empty? uids)
+      (err "missing-slot" {:action "expand"
+                           :reason "target resolved to no uids"}))
+    (doseq [uid uids]
+      (roam-set-block-open graph uid true))
+    {:uids uids :count (count uids)}))
+
+(defmethod dispatch "zoom"
+  [_ {:keys [target]} {:keys [graph] :as ctx}]
+  (let [region (resolve-target-implicit ctx target "zoom")
+        first-r (first region)
+        uid (:uid first-r)
+        page-title (:page-title first-r)]
+    (when-not uid
+      (err "missing-slot" {:action "zoom" :reason "target resolved to no uid"}))
+    (if page-title
+      (roam-api graph "ui.mainWindow.openPage" {"page" {"uid" uid}})
+      (roam-api graph "ui.mainWindow.openBlock" {"block" {"uid" uid}}))
+    {:uids [uid] :uid uid :count 1}))
+
+(defmethod dispatch "openInSidebar"
+  [_ {:keys [target]} {:keys [graph] :as ctx}]
+  (let [region (resolve-target-implicit ctx target "openInSidebar")
+        uids   (mapv :uid region)]
+    (when (empty? uids)
+      (err "missing-slot" {:action "openInSidebar"
+                           :reason "target resolved to no uids"}))
+    (doseq [uid uids]
+      (roam-api graph "ui.rightSidebar.addWindow"
+                {"window" {"type" "outline" "block-uid" uid}}))
+    {:uids uids :count (count uids)}))
+
+(defmethod dispatch "getText"
+  [_ {:keys [target]} {:keys [graph] :as ctx}]
+  (let [region (resolve-target-implicit ctx target "getText")
+        uids   (mapv :uid region)
+        texts  (mapv (fn [uid] {:uid uid
+                                :string (or (get-block-string graph uid) "")})
+                     uids)]
+    (when (empty? uids)
+      (err "missing-slot" {:action "getText"
+                           :reason "target resolved to no uids"}))
+    {:uids uids :texts texts :count (count uids)}))
+
+(defmethod dispatch "getRefs"
+  [_ {:keys [target]} {:keys [graph] :as ctx}]
+  (let [region (resolve-target-implicit ctx target "getRefs")
+        uids   (mapv :uid region)
+        refs   (vec
+                 (mapcat
+                   (fn [uid]
+                     (let [rows (roam-q graph
+                                  (str "[:find ?ruid ?rs :where
+                                          [?b :block/uid \"" (esc-dq uid) "\"]
+                                          [?r :block/refs ?b]
+                                          [?r :block/uid ?ruid]
+                                          [?r :block/string ?rs]]"))]
+                       (mapv (fn [[ruid rs]]
+                               {:uid ruid :string rs :target uid})
+                             rows)))
+                   uids))]
+    (when (empty? uids)
+      (err "missing-slot" {:action "getRefs"
+                           :reason "target resolved to no uids"}))
+    {:uids uids :refs refs :count (count refs)}))
+
+(defmethod dispatch "nudge"
+  [_ {:keys [target direction]} {:keys [graph] :as ctx}]
+  (when-not direction
+    (err "missing-slot" {:action "nudge" :slot "direction"}))
+  (let [region (resolve-target-implicit ctx target "nudge")
+        first-r (first region)
+        uid (:uid first-r)
+        dir-kw (keyword direction)]
+    (when-not uid
+      (err "missing-slot" {:action "nudge" :reason "target resolved to no uid"}))
+    (let [parent (get-parent-uid graph uid)
+          order  (when parent (get-block-order graph uid))
+          siblings (when parent (get-children-uids graph parent))
+          idx (when siblings (.indexOf siblings uid))]
+      (case dir-kw
+        :up (if (and idx (> idx 0))
+              (roam-move-block graph uid parent (dec order))
+              (let [gp (when parent (get-parent-uid graph parent))
+                    psibs (when gp (get-children-uids graph gp))
+                    pidx (when psibs (.indexOf psibs parent))
+                    prev-parent (when (and pidx (> pidx 0))
+                                  (nth psibs (dec pidx)))]
+                (when prev-parent
+                  (roam-move-block graph uid prev-parent "last"))))
+        :down (if (and idx (< idx (dec (count siblings))))
+                (let [next-uid (nth siblings (inc idx))]
+                  (roam-move-block graph next-uid parent order))
+                (let [gp (when parent (get-parent-uid graph parent))
+                      psibs (when gp (get-children-uids graph gp))
+                      pidx (when psibs (.indexOf psibs parent))
+                      next-parent (when (and pidx (< pidx (dec (count psibs))))
+                                    (nth psibs (inc pidx)))]
+                  (when next-parent
+                    (roam-move-block graph uid next-parent 0))))
+        :left-above (let [gp (get-parent-uid graph parent)
+                          po (get-block-order graph parent)]
+                      (when-not gp (err "missing-slot"
+                                        {:action "nudge"
+                                         :reason "already at top level"}))
+                      (roam-move-block graph uid gp po))
+        :left-below (let [gp (get-parent-uid graph parent)
+                          po (get-block-order graph parent)]
+                      (when-not gp (err "missing-slot"
+                                        {:action "nudge"
+                                         :reason "already at top level"}))
+                      (roam-move-block graph uid gp (inc po)))
+        :right (when (and idx (> idx 0))
+                 (roam-move-block graph uid (nth siblings (dec idx)) "last"))
+        :right-below (when (and idx (< idx (dec (count siblings))))
+                       (roam-move-block graph uid (nth siblings (inc idx)) "first"))
+        (err "unknown-direction" {:action "nudge" :direction direction}))
+      {:uids [uid] :uid uid :direction direction})))
+
+;; ── Source+destination shape (Step 10) ─────────────────────────────────
+;; moveToTarget / linkToTarget / aliasMove. Source uids are captured
+;; pre-action so the :source pronoun is reliable even when the source
+;; AST is modifier-based (e.g. "every child of B" — those children
+;; won't be children of B after the move).
+
+(defn- src-uid-maps
+  "Build the {:uid :label :text} shape that move-uids!/link-uids! expect."
+  [graph uids]
+  (mapv (fn [uid] {:uid uid :label nil
+                   :text (or (get-block-string graph uid) "")})
+        uids))
+
+(defn- dest-tgt-shape
+  "Build the legacy {:uid :name :order :anchor-uid} shape from a resolved
+   destination (the legacy move-uids!/link-uids! API)."
+  [{:keys [parent-uid order anchor-uid]}]
+  {:uid parent-uid :name "destination"
+   :order order :anchor-uid anchor-uid})
+
+(defmethod dispatch "moveToTarget"
+  [_ {:keys [source destination]} {:keys [graph] :as ctx}]
+  (let [src-region (resolve-source-implicit ctx source "moveToTarget")
+        src-uids   (mapv :uid src-region)
+        dest       (resolve-destination-implicit ctx destination
+                                                 "moveToTarget" src-region)
+        tgt-shape  (dest-tgt-shape dest)]
+    (when (empty? src-uids)
+      (err "missing-slot" {:action "moveToTarget" :reason "no source uids"}))
+    (move-uids! graph (src-uid-maps graph src-uids) tgt-shape false)
+    {:uids src-uids :source-uids src-uids
+     :count (count src-uids)
+     :destination dest}))
+
+(defmethod dispatch "aliasMove"
+  [_ {:keys [source destination]} {:keys [graph] :as ctx}]
+  (let [src-region (resolve-source-implicit ctx source "aliasMove")
+        src-uids   (mapv :uid src-region)
+        dest       (resolve-destination-implicit ctx destination
+                                                 "aliasMove" src-region)
+        tgt-shape  (dest-tgt-shape dest)]
+    (when (empty? src-uids)
+      (err "missing-slot" {:action "aliasMove" :reason "no source uids"}))
+    (move-uids! graph (src-uid-maps graph src-uids) tgt-shape true)
+    {:uids src-uids :source-uids src-uids
+     :count (count src-uids)
+     :destination dest}))
+
+(defmethod dispatch "linkToTarget"
+  [_ {:keys [source destination]} {:keys [graph] :as ctx}]
+  (let [src-region (resolve-source-implicit ctx source "linkToTarget")
+        src-uids   (mapv :uid src-region)
+        dest       (resolve-destination-implicit ctx destination
+                                                 "linkToTarget" src-region)
+        tgt-shape  (dest-tgt-shape dest)]
+    (when (empty? src-uids)
+      (err "missing-slot" {:action "linkToTarget" :reason "no source uids"}))
+    (link-uids! graph (src-uid-maps graph src-uids) tgt-shape)
+    {:uids src-uids :source-uids src-uids
+     :count (count src-uids)
+     :destination dest}))
+
+;; ── Destination-only shape (Step 11) ────────────────────────────────────
+
+(defmethod dispatch "insertNewBlock"
+  [_ {:keys [destination string]
+      :or {string ""}}
+   {:keys [graph] :as ctx}]
+  (let [dest (resolve-destination-implicit ctx destination
+                                           "insertNewBlock" nil)
+        new-uid   (str "nb-" (subs (str (java.util.UUID/randomUUID)) 0 9))
+        api-order (cond
+                    (= (:order dest) 0)      0
+                    (= (:order dest) :first) 0
+                    (or (= (:order dest) "last") (= (:order dest) :last))
+                    "last"
+                    :else (:order dest))]
+    (roam-api graph "data.block.create"
+              {"location" {"parent-uid" (:parent-uid dest)
+                           "order"      api-order}
+               "block"    {"uid" new-uid "string" string}})
+    (roam-api graph "ui.setBlockFocusAndSelection"
+              {"location" {"block-uid" new-uid "window-id" "main-window"}})
+    {:uids [new-uid] :uid new-uid
+     :destination dest
+     :string string}))
+
+;; ── Two-target shape (Step 12) ──────────────────────────────────────────
+;; swap, swapContent — both targets must be explicit (per §7).
+;; Logic ported from legacy swap-blocks!: handles non-nested, deep nested
+;; (content swap), and direct parent→child nested (positional swap).
+
+(defn- swap-uids!
+  "Core swap operation between two uids. content?=true forces content swap.
+   Returns {:uids [a b] :mode :swapped|:nested-positional|:nested-content}."
+  [graph uid-a uid-b content?]
+  (let [text-a   (get-block-string graph uid-a)
+        text-b   (get-block-string graph uid-b)
+        path-a-b (ancestor-path graph uid-a uid-b)
+        path-b-a (ancestor-path graph uid-b uid-a)
+        nested?  (or path-a-b path-b-a)]
+    (cond
+      ;; ── Non-nested: swap positions ──────────────────────────────────
+      (not nested?)
+      (let [parent-a (get-parent-uid graph uid-a)
+            parent-b (get-parent-uid graph uid-b)
+            order-a  (get-block-order graph uid-a)
+            order-b  (get-block-order graph uid-b)]
+        (if (= parent-a parent-b)
+          (let [[u1 o1 u2 o2] (if (< order-a order-b)
+                                [uid-a order-a uid-b order-b]
+                                [uid-b order-b uid-a order-a])]
+            (roam-move-block graph u2 parent-a o1)
+            (roam-move-block graph u1 parent-a o2))
+          (do (roam-move-block graph uid-a parent-b order-b)
+              (roam-move-block graph uid-b parent-a order-a)))
+        {:uids [uid-a uid-b] :mode :swapped})
+
+      ;; ── Nested: content swap (explicit or deep) ─────────────────────
+      (or content?
+          (> (count (or path-a-b path-b-a)) 1))
+      (let [[anc desc] (if path-a-b [uid-a uid-b] [uid-b uid-a])]
+        (swap-nested-content! graph anc desc
+                              (or anc "ancestor") (or desc "descendant")
+                              text-a text-b)
+        {:uids [uid-a uid-b] :mode :nested-content})
+
+      ;; ── Nested direct parent→child: positional swap ─────────────────
+      :else
+      (let [[anc desc] (if path-a-b [uid-a uid-b] [uid-b uid-a])]
+        (swap-nested-positional! graph anc desc
+                                 (or anc "ancestor") (or desc "descendant"))
+        {:uids [uid-a uid-b] :mode :nested-positional}))))
+
+(defmethod dispatch "swap"
+  [_ {:keys [target1 target2]} ctx]
+  (when-not (and target1 target2)
+    (err "missing-slot" {:action "swap" :reason "both targets required"}))
+  (let [r1 (resolve-target ctx target1)
+        r2 (resolve-target ctx target2)
+        uid-a (:uid (first r1))
+        uid-b (:uid (first r2))]
+    (when-not (and uid-a uid-b)
+      (err "missing-slot" {:action "swap"
+                           :reason "targets resolved to no uids"}))
+    (let [res (swap-uids! (:graph ctx) uid-a uid-b false)]
+      (assoc res :count 2))))
+
+(defmethod dispatch "swapContent"
+  [_ {:keys [target1 target2]} ctx]
+  (when-not (and target1 target2)
+    (err "missing-slot" {:action "swapContent" :reason "both targets required"}))
+  (let [r1 (resolve-target ctx target1)
+        r2 (resolve-target ctx target2)
+        uid-a (:uid (first r1))
+        uid-b (:uid (first r2))]
+    (when-not (and uid-a uid-b)
+      (err "missing-slot" {:action "swapContent"
+                           :reason "targets resolved to no uids"}))
+    (let [res (swap-uids! (:graph ctx) uid-a uid-b true)]
+      (assoc res :count 2))))
 
 (defmethod dispatch :default [name action _ctx]
   (err "unknown-action" {:name name :action action}))
@@ -1597,15 +2070,20 @@
 
 (defn- update-pronouns-after!
   "After a successful dispatch, mirror the operated-on uids into pronouns.
-   :that  ← uids the action acted on (returned in the dispatch result)
-   :source ← source-slot uids when the action carries a source slot"
+   :that   ← :uids from dispatch result (what the user just acted on)
+   :source ← :source-uids from result when present (captured pre-action by
+             the dispatch method itself — required for moveToTarget/etc.
+             since modifier-based sources won't re-resolve to the same
+             uids post-action). Fallback to AST re-resolve for stable
+             label/uid sources."
   [graph action result ctx]
-  (let [now    (System/currentTimeMillis)
-        uids   (some-> result :uids vec)
-        src    (when (contains? source-slot-actions (:name action))
-                 (when-let [s (:source action)]
-                   (try (mapv :uid (resolve-target ctx s))
-                        (catch Exception _ nil))))]
+  (let [now  (System/currentTimeMillis)
+        uids (some-> result :uids vec)
+        src  (or (some-> result :source-uids vec)
+                 (when (contains? source-slot-actions (:name action))
+                   (when-let [s (:source action)]
+                     (try (mapv :uid (resolve-target ctx s))
+                          (catch Exception _ nil)))))]
     (update-pronouns! graph
       (fn [p]
         (cond-> p
@@ -1636,6 +2114,23 @@
            result   (dispatch (:name action) action ctx)]
        (update-pronouns-after! graph action result ctx)
        result))))
+
+(defn execute-from-file!
+  "Phase E entry point — slurp a JSON envelope written by Talon, parse,
+   dispatch via execute!. Lets Python avoid shell-quoting hell when the
+   payload contains apostrophes / embedded quotes / spoken text.
+
+   Talon writes a unique /tmp/roam-bridge-cmd-<id>.json then shells:
+     bb -e '(load-file \"bridge.clj\") (execute-from-file! \"/tmp/...\")'
+
+   On success, deletes the envelope file. On failure, leaves it for
+   post-mortem inspection."
+  [path]
+  (let [payload (json/parse-string (slurp path) true)
+        result  (execute! payload)]
+    (try (.delete (java.io.File. ^String path))
+         (catch Exception _ nil))
+    result))
 
 (comment
   ;; Phase B smoke test — round-trip a setSelection envelope to label A.
