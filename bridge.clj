@@ -1219,9 +1219,8 @@
 (defn- save-pronouns! [graph p]
   (spit (pronouns-file graph) (json/generate-string p)))
 
-(def ^:private pronouns-cache
-  "In-process cache to avoid re-reading the file per ctx call."
-  (atom {}))
+;; In-process cache — survives (load-file) reloads in daemon mode.
+(defonce ^:private pronouns-cache (atom {}))
 
 (defn- get-pronouns [graph]
   (or (get @pronouns-cache graph)
@@ -2185,3 +2184,28 @@
              :action {:name "setSelection"
                       :target {:type "primitive"
                                :mark {:type "that"}}}}))
+
+;; ═══ Daemon mode (Phase G+) ═══════════════════════════════════════════
+;; When bridge.clj is run directly (`bb bridge.clj`), start an nREPL
+;; server and stay open. Talon sends commands via:
+;;   clj-nrepl-eval --port 7888 '(execute! {:version 1 ...})'
+;;
+;; Pronouns live in the atom (no file persistence needed in daemon mode).
+;; Hot-reload: clj-nrepl-eval --port 6888 '(load-file "bridge.clj")'
+;;   (defonce on pronouns-cache preserves state across reloads)
+;;   (defonce on __daemon-started guards against double nREPL bind)
+
+(defonce ^:private __daemon-started (atom false))
+
+(when (and (= *file* (System/getProperty "babashka.file"))
+           (not @__daemon-started))
+  (reset! __daemon-started true)
+  (alter-var-root #'*persist-pronouns?* (constantly false))
+  (require '[babashka.nrepl.server :as nrepl])
+  (let [port 6888
+        srv  ((resolve 'nrepl/start-server!) {:host "127.0.0.1" :port port})]
+    (println (str "🚀 Bridge daemon ready on port " port))
+    (println "   Send commands: clj-nrepl-eval --port 6888 '(execute! {...})'")
+    (println "   Reload code:   clj-nrepl-eval --port 6888 '(load-file \"bridge.clj\")'")
+    (spit ".nrepl-port" (str port))
+    @(promise)))

@@ -20,16 +20,15 @@
  *   __state__
  *     └─ {"ts":1234,"main":{...},"sidebar":[...],"focused":...}
  *
- * Command types:
+ * Command types (9 — Phase G removed get-view + delete-blocks):
  *   nav-mode    — {scope?: "main"|"sidebar"|"all"}  ← persistent auto-labelling
  *   nav-off     — {}                                 ← turn off auto-labelling
  *   annotate    — {blocks: [{uid, label, intent?}]}
  *   clear       — {}
- *   get-view    — {}
  *   scan-blocks — {scope?: "main"|"sidebar"|"all", include_text?: bool}
  *   eval        — {code: "..."}
  *   select-block— {uid|uids, window_id?, mode?: "focus"|"edit"}  ← highlight or edit block(s)
- *   delete-blocks— {labels?: ["A","B"], uids?: ["uid1"]}        ← delete blocks by label or uid
+ *   clear-selection — {}                             ← remove focus highlights
  *   notify      — {message: "...", intent?: "info"|"warning"|"error"|"success"}
  *
  * ─────────────────────────────────────────────────────────────────────
@@ -64,6 +63,13 @@ let renderingInProgress = false; // suppress observer during our own DOM writes
 let activeClearOnInteract = null; // tracked for cleanup on unload
 let selectedBlockUids = []; // UIDs of blocks highlighted via select-block focus mode
 let toasterInstance = null; // cached Blueprint Toaster (avoids React root leaks)
+
+// ── labelsVersion ring buffer (Phase G step 22) ──────────────────────
+// Stores the last N label snapshots so stale commands can be detected.
+// Each entry: { ts: <state.ts at snapshot time>, labels: <activeLabelMap copy> }
+const LABELS_CACHE_SIZE = 4;
+let labelsCache = []; // ring buffer of {ts, labels}
+let currentLabelsVersion = null; // ts of the most recent label snapshot
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -359,10 +365,87 @@ function updateLabelMap(scannedBlocks) {
   for (const { label, uid, region } of scannedBlocks) {
     activeLabelMap[label] = { uid, region: region || "main" };
   }
+  snapshotLabels();
 }
 
 function clearLabelMap() {
   activeLabelMap = {};
+  currentLabelsVersion = null;
+}
+
+/**
+ * Snapshot the current label map into the ring buffer.
+ * Called every time labels are updated (nav-mode rescan, annotate, scan-blocks).
+ */
+function snapshotLabels() {
+  const ts = Date.now();
+  currentLabelsVersion = ts;
+  labelsCache.push({ ts, labels: { ...activeLabelMap } });
+  if (labelsCache.length > LABELS_CACHE_SIZE) {
+    labelsCache = labelsCache.slice(-LABELS_CACHE_SIZE);
+  }
+}
+
+/**
+ * Check a command's labelsVersion against the cache.
+ * Returns null if valid (or not provided), or an error object if stale.
+ */
+function checkLabelsVersion(labelsVersion) {
+  if (labelsVersion === undefined || labelsVersion === null) return null;
+  if (labelsVersion === currentLabelsVersion) return null;
+  // Check the ring buffer for a matching snapshot
+  for (const entry of labelsCache) {
+    if (entry.ts === labelsVersion) return null;
+  }
+  return {
+    error: "stale-labels",
+    received: labelsVersion,
+    current: currentLabelsVersion,
+    hint: "labelsVersion does not match any recent snapshot. Re-read __state__.labelsVersion and retry.",
+  };
+}
+
+// ── Target AST resolver (Phase G step 24) ────────────────────────────
+//
+// Minimal resolver for the JS side. Only resolves mark types that the
+// extension already knows about: label (via activeLabelMap) and uid
+// (pass-through). Modifiers are NOT supported here — callers that need
+// modifier resolution must pre-resolve to UIDs in bridge.clj.
+
+/**
+ * Resolve a target AST to an array of {uid, region?} objects.
+ * Returns null on resolution failure (unknown mark, label not found).
+ */
+function resolveTarget(target) {
+  if (!target || !target.type) return null;
+  switch (target.type) {
+    case "primitive": {
+      const mark = target.mark;
+      if (!mark) return null;
+      switch (mark.type) {
+        case "label": {
+          const val = mark.value;
+          const entry = activeLabelMap[val] || activeLabelMap[val?.toUpperCase?.()];
+          if (!entry) return null;
+          return [{ uid: entry.uid, region: entry.region }];
+        }
+        case "uid":
+          return [{ uid: mark.value }];
+        default:
+          return null; // cursor, pageTitle, daily, pronoun, phrase — not resolved JS-side
+      }
+    }
+    case "list": {
+      const results = [];
+      for (const el of (target.elements || [])) {
+        const resolved = resolveTarget(el);
+        if (resolved) results.push(...resolved);
+      }
+      return results.length > 0 ? results : null;
+    }
+    default:
+      return null; // range, implicit — not resolved JS-side
+  }
 }
 
 // ── Nav Mode (auto-rescan) ───────────────────────────────────────────
@@ -487,10 +570,13 @@ async function captureViewState() {
     focused: focused || null,
   };
 
-  // Include active label map when annotations are present
+  // Include active label map and version when annotations are present
   const labelKeys = Object.keys(activeLabelMap);
   if (labelKeys.length > 0) {
     state.labels = activeLabelMap; // {"A": {uid, region}, ...}
+    if (currentLabelsVersion) {
+      state.labelsVersion = currentLabelsVersion;
+    }
   }
 
   if (selectedBlockUids.length > 0) {
@@ -586,7 +672,7 @@ async function writeResponse(commandBlockUid, id, status, result) {
 }
 
 async function processCommand(commandBlockUid, cmd) {
-  const { id, type, args, version } = cmd;
+  const { id, type, args, version, labelsVersion } = cmd;
 
   if (processedCommandIds.has(id)) return;
   processedCommandIds.add(id);
@@ -621,6 +707,15 @@ async function processCommand(commandBlockUid, cmd) {
     });
     return;
   }
+
+  // --- Phase G step 22: labelsVersion staleness check --------------------
+  // If sender includes labelsVersion, verify it matches a recent snapshot.
+  // Commands that don't depend on labels (e.g. eval, notify) may omit it.
+  const staleErr = checkLabelsVersion(labelsVersion);
+  if (staleErr) {
+    await writeResponse(commandBlockUid, id, "error", staleErr);
+    return;
+  }
   // -----------------------------------------------------------------------
 
   try {
@@ -649,11 +744,7 @@ async function processCommand(commandBlockUid, cmd) {
         break;
       }
 
-      case "get-view": {
-        const state = await captureViewState();
-        await writeResponse(commandBlockUid, id, "done", state);
-        break;
-      }
+      // "get-view" removed in Phase G — callers read __state__ directly.
 
       case "nav-mode": {
         await startNavMode(args?.scope);
@@ -673,14 +764,22 @@ async function processCommand(commandBlockUid, cmd) {
       }
 
       case "select-block": {
-        // Accept single uid or array of uids
-        const uids = (args?.uids || (args?.uid ? [args.uid] : [])).filter(isValidUid);
+        // Accept single uid, array of uids, or a target AST (Phase G)
+        let uids = (args?.uids || (args?.uid ? [args.uid] : [])).filter(isValidUid);
         const windowId = args?.window_id || "main-window";
         const mode = args?.mode || "focus"; // "focus" = highlight, "edit" = text input
 
+        // Phase G: resolve target AST if provided and no direct uids given
+        if (uids.length === 0 && args?.target) {
+          const resolved = resolveTarget(args.target);
+          if (resolved) {
+            uids = resolved.map(r => r.uid).filter(isValidUid);
+          }
+        }
+
         if (uids.length === 0) {
           await writeResponse(commandBlockUid, id, "error", {
-            error: "No uid(s) provided",
+            error: "No uid(s) provided or target could not be resolved",
           });
           break;
         }
@@ -770,42 +869,7 @@ async function processCommand(commandBlockUid, cmd) {
         break;
       }
 
-      case "delete-blocks": {
-        // Accept labels (resolved via activeLabelMap) or direct uids
-        const labels = args?.labels || [];
-        const directUids = [...(args?.uids || [])].filter(isValidUid);
-        const deleted = [];
-        const notFound = [];
-
-        // Resolve labels to UIDs
-        for (const label of labels) {
-          const entry = activeLabelMap[label] || activeLabelMap[label.toUpperCase()];
-          if (entry?.uid) {
-            directUids.push(entry.uid);
-          } else {
-            notFound.push(label);
-          }
-        }
-
-        // Delete each block
-        for (const uid of directUids) {
-          try {
-            await window.roamAlphaAPI.data.block.delete({
-              block: { uid },
-            });
-            deleted.push(uid);
-          } catch (delErr) {
-            notFound.push(uid);
-          }
-        }
-
-        await writeResponse(commandBlockUid, id, "done", {
-          deleted,
-          not_found: notFound,
-          count: deleted.length,
-        });
-        break;
-      }
+      // "delete-blocks" removed in Phase G — bridge.clj uses Local API directly.
 
       case "scan-blocks": {
         const scope = args?.scope || "all";
@@ -1047,6 +1111,7 @@ export function onunload() {
   stopStatePolling();
   clearAllAnnotations();
   clearLabelMap();
+  labelsCache = [];
   removeStyles();
   processedCommandIds.clear();
 

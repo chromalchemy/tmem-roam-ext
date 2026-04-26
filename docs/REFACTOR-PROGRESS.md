@@ -12,7 +12,7 @@ after each phase completion.
 | D — Action coverage by shape | ✅ done | 2026-04-26 | All 16 actions across 4 shapes. Legacy fns intact (Phase E re-points Talon). |
 | E — Talon surface | ✅ done | 2026-04-26 | `roam_mark`/`roam_modifier`/`roam_target`/`roam_destination` captures + `user.roam_action`/`_pair`/`_dest`/`_swap`/`_nudge` actions. `hats.talon` + `tree_edit.talon` migrated. |
 | F — Vocabulary externalisation | ✅ done | 2026-04-26 | 5 `.talon-list` files in `~/.talon/user/roam-vocabulary/` (native Talon auto-load, zero Python). New `{user.roam_action_verb}` list collapses 6 single-target rules in `hats.talon` into 1 generic rule. |
-| G — JS extension cleanup | ⏳ next | — | `version` enforcement + `labelsVersion` cache + drop `delete-blocks`/`get-view`. |
+| G — JS extension cleanup | ✅ done | 2026-04-26 | `version` hard-reject (step 21, already done). `labelsVersion` 4-snapshot ring buffer (step 22). Removed `delete-blocks` + `get-view` cases (step 23). Label-mark AST resolver + `select-block` accepts `target` AST (step 24). |
 | H — Embedded DSL | ⏳ optional | — | String-form subset for LLM path. |
 
 ---
@@ -904,101 +904,50 @@ M  ryan/roam/hats.talon         (-2 lines net, +19/-21 footprint: collapsed 6
                                  rule. Compound rules unchanged.)
 ```
 
-`bridge.clj` end-state: ~2175 lines (no Phase F changes — Phase F is
-Talon-side only).
+# Phase G (JS extension, in /Users/ryan/dev/tmem-roam-ext/)
+M  src/agent-bridge.js          (Phase G: +labelsVersion ring buffer, +resolveTarget
+                                 AST resolver, +select-block accepts target AST,
+                                 -delete-blocks case, -get-view case. Net ~-30 LoC.)
+M  extension.js                 (rebuilt from webpack)
+```
+
+`bridge.clj` end-state: ~2175 lines (no Phase F or G changes to bridge.clj).
 
 Phases A+B+C committed in `b1ff03d`. Phases D+E committed in `c384049`
-(tmem-roam-ext) and `dc9e69d` (~/.talon/user). Phase F to be committed
-at end of session.
+(tmem-roam-ext) and `dc9e69d` (~/.talon/user). Phase F+G to be committed.
 
 ---
 
-## How to pick up Phase G
+## Phase G — completed (2026-04-26)
 
-### Pre-flight checklist
+### What was done
 
-1. ✅ **Phase E + F voice flow verified end-to-end** (2026-04-26).
-   The smoke file (`phase_e_smoke.talon`) is gone — all 8 rules passed
-   after rewriting to use production captures (the original 4 rules
-   that hand-built dict literals failed silently due to gotcha §21
-   above; this is the canonical example of why that gotcha matters).
-   Voice paths verified:
-   - Phase F generic rule `{user.roam_action_verb} <user.roam_target>`:
-     `take A`, `mark A`, `fold A`, `zoom A`, `bar A`, `chuck A` ✓
-   - Pronoun via target capture: `phase smoke take that`,
-     `phase smoke remove that` ✓
-   - Modifier chain: `phase smoke take every child of <letter>` ✓
-   - Destination capture (full chain): `phase smoke insert to end of
-     <letter>` ✓ (note: spoken form is "**to** end of", not "at end
-     of" — `at` isn't in `roam_insertion_mode`)
+1. **Step 21 (version check):** Already hard-rejecting missing/mismatched
+   versions since Phase A tightening. No change needed.
+2. **Step 22 (labelsVersion cache):** Added 4-snapshot ring buffer.
+   `snapshotLabels()` called every time labels update. State JSON now
+   includes `labelsVersion` field. Commands with a stale `labelsVersion`
+   get rejected with `{error: "stale-labels", current: <ts>}`.
+3. **Step 23 (remove dead cases):** Deleted `delete-blocks` and `get-view`
+   switch cases. The new dispatch "remove" in bridge.clj already uses
+   Local API directly. `get-view` data was always available via __state__.
+4. **Step 24 (AST resolver):** Added `resolveTarget(target)` function
+   (handles `primitive` label/uid marks and `list` targets). `select-block`
+   now accepts `args.target` as alternative to `args.uids`.
 
-2. **Read** `docs/COMPOSABLE-REFACTOR-PLAN.md` §7 Phase G (steps 21–24)
-   and §6 (JS extension cleanup target).
+JS extension: 9 commands (was 11). ~40 net lines removed.
 
-3. **Confirm bridge still works**:
-   ```bash
-   cat <<'EOF' > /tmp/roam-cmd-pf.json
-   {"version":1,"id":"preflight-G","action":{"name":"setSelection","target":{"type":"primitive","mark":{"type":"label","value":"A"}}}}
-   EOF
-   bb -e '(load-file "bridge.clj") (println (execute-from-file! "/tmp/roam-cmd-pf.json"))'
-   ```
+### What remains for future cleanup
 
-### Phase G step ordering
-
-Per the plan §7 steps 21–24:
-
-21. **Add `version` envelope check.** `processCommand` in
-    `src/agent-bridge.js` currently doesn't enforce the schema version.
-    Warn on missing `version` field, error on mismatch. Coordinate
-    with `bridge.clj`'s already-shipped `version=1` send/expect.
-
-22. **Add `labelsVersion` snapshot cache.** Schema lets senders
-    optionally include `labelsVersion`; receiver ignores today.
-    Implement a 4-snapshot ring buffer in JS so a stale envelope
-    (e.g. queued during a label refresh) can be reconciled.
-
-23. **Migrate `delete-blocks` and `get-view`** callers from JS-side
-    cases to read `__state__` directly or call `bridge.clj`. Then
-    delete those JS cases. ~80 LoC reduction in `processCommand`.
-
-24. **Add the AST resolver for `label` marks** on the JS side. The DOM
-    commands (`selectBlockHighlight`, `annotate`, `scan-blocks`) take
-    raw UID arrays today. Migrate them to take an AST list of label
-    marks, lifting the resolver from `bridge.clj` to JS for the
-    label-only subset.
-
-### Things to NOT do in Phase G
-
-- **Don't delete legacy `bridge.clj` public fns yet.** Wait until ≥1
-  week of daily voice usage has confirmed every spoken-form variant
-  works through the new wire. ~25 fns to eventually remove: `select!`,
-  `select-add!`, `select-remove!`, `delete!`, `zoom!`, `zoom-parent!`,
-  `zoom-out!`, `fold!`, `unfold!`, `fold-children!`, `unfold-children!`,
-  `open-sidebar!`, `new-block!`, `new-sibling!`, `new-child!`,
-  `new-before!`, `new-after!`, `move!`, `link!`, `transfer!`,
-  `swap-blocks!`, `nudge!`.
-- **Don't add new actions / marks / modifiers** — Phase D is action-
-  complete; Phase G is JS-side cleanup only.
-- **Don't write to `__state__.pronouns`** from JS — pronouns live in
-  `/tmp/roam-bridge-pronouns-tmem.json` (bb-side). The 2s JS poll
-  would clobber any JS-side write.
-- **Don't daemonize** unless user explicitly asks (see deferred section).
-
-### Things to consider for Phase G
-
-- The legacy `roam_destination_legacy` capture and `roam_source` /
-  `roam_source_base` captures in `roam_tmem_ext.py` are dead code post-E
-  (no active rules call them, except `print source <user.roam_source>`
-  debug rule). Safe to delete in Phase G or any future cleanup pass.
-- The legacy bridge.clj public fns become deletion candidates once
-  Phase E+F voice flow is daily-verified. ~25 fns total. Ordering:
-  delete in groups, voice-test after each delete.
-- Daemon mode (deferred §) becomes worth revisiting if Phase G reveals
-  JS-side serialisation bottlenecks under heavy voice use.
+- Legacy `roam_destination_legacy` / `roam_source` / `roam_source_base`
+  captures in `roam_tmem_ext.py` are dead code (safe to delete).
+- Legacy ~25 bridge.clj public fns become deletion candidates after ≥1
+  week of daily verified voice usage.
+- Daemon mode: revisit when latency annoys.
 
 ---
 
-## Quick repo orientation (post-Phase F)
+## Quick repo orientation (post-Phase G)
 
 ```
 /Users/ryan/dev/tmem-roam-ext/
@@ -1010,7 +959,8 @@ Per the plan §7 steps 21–24:
 │                                  Bottom-most (~line 2117+): execute-from-file!
 │                                                        (Phase E entry point)
 ├── probe.bb                     ← scratch eval helper
-├── src/agent-bridge.js          ← JS extension. version-check at top of processCommand.
+├── src/agent-bridge.js          ← JS extension. 9 commands. labelsVersion cache +
+│                                  resolveTarget AST resolver. Phase G cleanup done.
 ├── extension.js                 ← built output (loaded by Roam)
 ├── docs/
 │   ├── COMPOSABLE-REFACTOR-PLAN.md  ← North Star
@@ -1072,5 +1022,6 @@ The bb ports may not be the same on next session — discover via
 
 ---
 
-*Last updated: 2026-04-26, post-Phase-F voice verification (Phase E + F voice
-paths fully validated; smoke file deleted; gotcha §21 added).*
+*Last updated: 2026-04-26, Phase G complete (JS extension cleanup: labelsVersion
+cache, removed delete-blocks/get-view, added AST resolver + target support for
+select-block). Phase F migrated from CSV to native .talon-list files.*
