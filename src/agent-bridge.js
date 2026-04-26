@@ -598,17 +598,21 @@ async function processCommand(commandBlockUid, cmd) {
     processedCommandIds = new Set(arr.slice(-400));
   }
 
-  // --- Phase A: schema lock (envelope version check) ---------------------
+  // --- Phase A+G: schema lock (envelope version check) -------------------
   // See docs/COMMAND-SCHEMA.md §1.
-  // - Missing version: warn and continue (transitional grace; tightened in
-  //   Phase G).
-  // - Mismatched version: hard reject.
+  // Phase A shipped a transitional grace where missing `version` warned
+  // and continued; Phase G (post-Phase-F voice verification) tightens to
+  // hard reject. All in-tree senders emit version=1:
+  //   - bridge.clj (legacy `send-command!` and new `execute-from-file!`)
+  //   - roam_tmem_ext.py (`_execute_envelope`)
+  // Any unversioned command at this point is a stale or third-party caller.
   if (version === undefined) {
-    console.warn(
-      `[agent-bridge] command ${id} (type=${type}) is missing "version"; ` +
-        `treating as legacy. New clients MUST send {"version":1}. ` +
-        `See docs/COMMAND-SCHEMA.md.`
-    );
+    await writeResponse(commandBlockUid, id, "error", {
+      error: "missing-version",
+      supported: [1],
+      hint: "Senders MUST include {\"version\":1}. See docs/COMMAND-SCHEMA.md §1.",
+    });
+    return;
   } else if (version !== 1) {
     await writeResponse(commandBlockUid, id, "error", {
       error: "unknown-version",

@@ -7,9 +7,11 @@ implement them.
 
 This document is **descriptive of intent**, not exhaustive of what the
 JS extension currently dispatches. The legacy `{id,type,args}` shape
-still works during the migration window (a missing `version` triggers a
-console warning, not a hard reject). New code on either side of the
-wire MUST emit `version: 1`.
+still works for the action types the JS extension still handles, but
+the envelope **must** include `version: 1`. (Phases A–F kept missing-
+version as a `console.warn`; Phase G tightened it to a hard reject —
+`{error: "missing-version"}` — once all in-tree senders were verified
+to emit version=1.)
 
 ---
 
@@ -35,14 +37,11 @@ shape:
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
-| `version` | required¹ | `1` | Hard-rejected if not `1`; warned if absent. Bump on any breaking change to envelope or AST. |
+| `version` | required | `1` | Hard-rejected if absent (`missing-version`) or not `1` (`unknown-version`). Bump on any breaking change to envelope or AST. |
 | `id` | required | `string` | Dedup key. Repeats are silently dropped by the receiver. |
 | `spokenForm` | optional | `string` | Pass-through label for logs. Never affects dispatch. |
 | `labelsVersion` | optional | `number` | The `__state__.ts` snapshot the sender saw at parse time. The bridge MAY reject the command with `{"error":"stale-labels","currentTs":N}` when a referenced `label` mark no longer resolves. |
 | `action` | required | `object` | See §5 for shapes. |
-
-¹ Transitional: missing `version` logs `console.warn` and is processed
-under legacy semantics. Phase G tightens this to a hard reject.
 
 ### Response shape
 
@@ -412,6 +411,7 @@ All errors are returned via the response shape (§1) with
 
 | `result.error`         | Cause |
 |---|---|
+| `missing-version`      | `version` field absent. (Phase G tightened from warn-and-continue.) |
 | `unknown-version`      | `version` field present but ≠ `1`. |
 | `unknown-action`       | `action.name` not in catalogue. |
 | `missing-slot`         | A required slot (per §5) is absent and no implicit default exists. |
