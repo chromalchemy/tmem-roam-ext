@@ -11,8 +11,8 @@ after each phase completion.
 | C — Mark + modifier coverage | ✅ done | 2026-04-25 | All 9 mark kinds + pronouns + phrase. |
 | D — Action coverage by shape | ✅ done | 2026-04-26 | All 16 actions across 4 shapes. Legacy fns intact (Phase E re-points Talon). |
 | E — Talon surface | ✅ done | 2026-04-26 | `roam_mark`/`roam_modifier`/`roam_target`/`roam_destination` captures + `user.roam_action`/`_pair`/`_dest`/`_swap`/`_nudge` actions. `hats.talon` + `tree_edit.talon` migrated. |
-| F — Vocabulary externalisation | ⏳ next | — | CSV-driven action/scope/pronoun vocab; auto-add-on-missing-row. |
-| G — JS extension cleanup | ⏳ later | — | `version` enforcement + `labelsVersion` cache + drop `delete-blocks`/`get-view`. |
+| F — Vocabulary externalisation | ✅ done | 2026-04-26 | 3 CSVs in `~/.talon/user/roam-vocabulary/` driven by `roam_csv.py` loader. Auto-add-on-missing + fs.watch reload. New `{user.roam_action_verb}` list collapses 6 single-target rules in `hats.talon` into 1 generic rule. |
+| G — JS extension cleanup | ⏳ next | — | `version` enforcement + `labelsVersion` cache + drop `delete-blocks`/`get-view`. |
 | H — Embedded DSL | ⏳ optional | — | String-form subset for LLM path. |
 
 ---
@@ -420,6 +420,22 @@ once voice surface is fully verified by daily use.
 
 ## Verified live (against running Roam graph "tmem")
 
+### Phase F vocabulary externalisation (verified 2026-04-26)
+
+| Test | Verification | Result |
+|---|---|---|
+| CSV load + populate 5 lists | `roam_csv.populate_lists()` from a stubbed Talon environment; counted entries per list | ✓ pronoun=8, action_verb=12, containing=4, every=14, ordinal=4 |
+| Legacy mapping preserved | Read `fold` from `roam-actions.csv` after load | ✓ resolves to `collapse` (intentional cross-mapping) |
+| Auto-add (lossy edit) | Stripped 10 of 12 rows from `roam-actions.csv`, called populate, checked CSV file | ✓ 8 default rows re-appended; `openInSidebar`/`expand`/`collapse`/`zoom` IDs all restored with their default spoken forms |
+| Auto-add (missing file) | `rm roam-actions.csv`, populate, check | ✓ file recreated with all 12 default rows; in-memory list size = 12 |
+| Bridge round-trip: chuck → remove | `/tmp/smoke-a.json` with `{action:remove, target:label A}` → `execute-from-file!` | ✓ `:deleted [R2ANBS2_6]`, file auto-deleted |
+| Bridge round-trip: take + every:child | `/tmp/smoke-b.json` setSelection w/ modifier chain | ✓ `:uids [...] :count 1` |
+| Bridge round-trip: zoom A | `/tmp/smoke-c.json` zoom + label | ✓ `:uid B0KYo_F-7 :count 1` |
+| Bridge round-trip: fold A (legacy mapping) | `/tmp/smoke-d.json` collapse + label (Talon CSV pre-resolves `fold`→`collapse`) | ✓ `:count 1` |
+
+Talon-engine grammar verification (voice → capture → envelope) deferred
+to user voice-test alongside Phase E smoke rules.
+
 ### Phase E Talon surface (verified 2026-04-26 via simulated envelopes)
 
 Talon was not running during the session, so voice paths were verified
@@ -763,6 +779,43 @@ Schema destination §6 produces `{:order 0 | "last"}`. Roam's
 the method. Don't try to send `:first`/`:last` keywords to the API —
 they're internal to legacy `create-and-focus-block!`.
 
+### 17. Phase F: list declarations live in exactly one module
+
+`mod.list("roam_pronoun", ...)` etc. now live in `roam_csv.py`. The
+captures referencing `{user.roam_pronoun}` etc. live in
+`roam_tmem_ext.py`. Talon resolves list names globally, so cross-file
+references work, but **only one module may declare a given list name**
+— double-declaration silently breaks list lookup. If you add a new CSV-
+driven list, declare it in `roam_csv.py` only.
+
+### 18. Phase F: lists populate on `app.register("ready", ...)`
+
+`roam_csv.py` defers `populate_lists()` until the Talon `ready` event
+fires (avoids race conditions with other modules). At module-import
+time, `ctx.lists["user.roam_*"]` are empty dicts. Voice commands can't
+fire pre-ready so this is invisible to users. **Don't run inline
+list-membership tests at module load** — they will see empty lists.
+
+### 19. Phase F: auto-add restores ALL defaults for a missing canonical ID
+
+When the user removes EVERY spoken form for a canonical ID from a CSV
+(e.g. drops both `bar,openInSidebar` and `sidebar,openInSidebar` rows),
+the loader re-adds **all** the default spoken forms for that ID, not
+just one. This is "soft restore" — generous repair, no canonical ID
+disappears. Removing one of two synonyms is safe (the ID still has
+≥1 row) and the loader won't touch the CSV.
+
+### 20. Phase F: action-verb generic rule and rule-specificity
+
+`{user.roam_action_verb} <user.roam_target>` in `hats.talon` is the
+most general rule covering the 6 single-target verbs. Compound rules
+(`take A and B`, `mark A done`, `take A classic`, `(zoom | load) (out
+| top)`, etc.) win via Talon's specificity ranking. **Watch out** when
+adding a new compound rule whose first word is also a CSV action verb
+— Talon will pick the more specific rule, but if they tie on
+specificity the behaviour is engine-defined. Run the generic rule's
+spoken form first to confirm dispatch.
+
 ---
 
 ## Files modified (cumulative)
@@ -803,97 +856,121 @@ M  tree_edit.talon              (12 new-block roam_fn rules → 12 inline-dict
                                  forms preserved; only the wire layer changed.)
 A  phase_e_smoke.talon          (temporary — voice-test rules for new captures.
                                  Delete after voice flow confirmed.)
+
+# Phase F (Talon side, in /Users/ryan/.talon/user/)
+A  roam-vocabulary/             (NEW directory mirroring cursorless-settings/)
+A  roam-vocabulary/roam-pronouns.csv  (8 rows, 1 list)
+A  roam-vocabulary/roam-actions.csv   (12 rows, 1 list — Phase F NEW list)
+A  roam-vocabulary/roam-scopes.csv    (22 rows, routes to 3 lists via 'Modifier kind' col)
+A  ryan/roam/roam_csv.py        (~250 lines: defaults dicts, CSV read/write,
+                                 populate_lists, auto-add-missing, fs.watch reload.
+                                 Owns the 5 mod.list declarations now.)
+M  ryan/roam/roam_tmem_ext.py   (-41 lines: removed 4 inline ctx.lists assignments
+                                 + 4 mod.list declarations for pronoun/containing/
+                                 every/ordinal — they live in roam_csv.py now.
+                                 Captures unchanged; Talon resolves list names
+                                 globally so cross-file references still work.)
+M  ryan/roam/hats.talon         (-2 lines net, +19/-21 footprint: collapsed 6
+                                 single-target action rules into one generic
+                                 `{user.roam_action_verb} <user.roam_target>`
+                                 rule. Compound rules unchanged.)
 ```
 
-`bridge.clj` end-state: ~2175 lines.
+`bridge.clj` end-state: ~2175 lines (no Phase F changes — Phase F is
+Talon-side only).
 
-No git commits yet. Working tree dirty. Run `git status` / `git diff` to
-see all changes.
+Phases A+B+C committed in `b1ff03d`. Phases D+E committed in `c384049`
+(tmem-roam-ext) and `dc9e69d` (~/.talon/user). Phase F to be committed
+at end of session.
 
 ---
 
-## How to pick up Phase F
+## How to pick up Phase G
 
 ### Pre-flight checklist
 
-1. **Voice-verify Phase E first.** A `phase_e_smoke.talon` was added
-   with 8 test rules. Speak each in a Roam window with `hats-on!`
-   active. If anything fails, the wire is solid (verified via
-   `execute-from-file!`) so the issue is in Talon's capture grammar.
-   Common pitfalls:
-   - `<user.roam_target>` overlap with existing rules in tree_edit/
-     tree_select — mostly handled by Talon's specificity ranking, but
-     watch for "take block start" type collisions.
-   - The `(zoom | load) <user.roam_target>` rule may catch utterances
-     intended for `(zoom | load) (forward | next) day` if the day
-     vocabulary leaks into a target capture. Tested on smoke rules,
-     but daily-relative phrasing may need a shadowing fix.
+1. **Voice-verify Phase E + F first.** `phase_e_smoke.talon` lives at
+   `/Users/ryan/.talon/user/ryan/roam/phase_e_smoke.talon`. Speak each
+   of its 8 rules in a Roam window with `hats-on!` active. Then
+   verify the new generic action-verb rule (Phase F) works: speak
+   `chuck A`, `take A`, `fold A`, `zoom A`, `bar A`, `mark A` — each
+   should produce the expected envelope (visible in
+   `/tmp/roam-bridge-cmd-*.json` if you suppress the auto-delete by
+   patching `execute-from-file!` to `(println path)` before delete).
+   If anything fails, the wire is solid (verified via simulated
+   envelopes); the issue is in Talon's capture grammar.
+
 2. **Delete the smoke file** once voice flow is confirmed:
    `rm /Users/ryan/.talon/user/ryan/roam/phase_e_smoke.talon`.
-3. **Read** `docs/COMPOSABLE-REFACTOR-PLAN.md` §7 Phase F (steps 19–20)
-   and §4 (CSV vocabulary externalisation).
-4. **Confirm bridge still works** (Phase E's
-   `execute-from-file!` is the new entry):
+
+3. **Read** `docs/COMPOSABLE-REFACTOR-PLAN.md` §7 Phase G (steps 21–24)
+   and §6 (JS extension cleanup target).
+
+4. **Confirm bridge still works**:
    ```bash
    cat <<'EOF' > /tmp/roam-cmd-pf.json
-   {"version":1,"id":"preflight-F","action":{"name":"setSelection","target":{"type":"primitive","mark":{"type":"label","value":"A"}}}}
+   {"version":1,"id":"preflight-G","action":{"name":"setSelection","target":{"type":"primitive","mark":{"type":"label","value":"A"}}}}
    EOF
    bb -e '(load-file "bridge.clj") (println (execute-from-file! "/tmp/roam-cmd-pf.json"))'
    ```
 
-### Phase F step ordering
+### Phase G step ordering
 
-Per the plan §7 steps 19–20:
+Per the plan §7 steps 21–24:
 
-19. **Move vocabulary into CSV files.** Create three CSVs in the Talon
-    user dir (or a new `roam-vocabulary/` subdir):
-    - `roam-actions.csv` — spoken-form → action name (e.g. `chuck,remove`)
-    - `roam-scopes.csv` — spoken-form → scope-type ID
-    - `roam-pronouns.csv` — spoken-form → pronoun
+21. **Add `version` envelope check.** `processCommand` in
+    `src/agent-bridge.js` currently doesn't enforce the schema version.
+    Warn on missing `version` field, error on mismatch. Coordinate
+    with `bridge.clj`'s already-shipped `version=1` send/expect.
 
-    Currently every list value is hardcoded in `roam_tmem_ext.py`'s
-    `ctx.lists` blocks. The CSV approach mirrors Cursorless's pattern
-    of `cursorless-settings/*.csv` (already in
-    `/Users/ryan/.talon/user/cursorless-settings/`).
+22. **Add `labelsVersion` snapshot cache.** Schema lets senders
+    optionally include `labelsVersion`; receiver ignores today.
+    Implement a 4-snapshot ring buffer in JS so a stale envelope
+    (e.g. queued during a label refresh) can be reconciled.
 
-20. **Write a CSV loader** that:
-    - Reads each CSV at module load time
-    - Populates the corresponding `ctx.lists["user.roam_*"]` dict
-    - Detects missing canonical rows on startup and auto-adds them
-      (Cursorless's "missing-line auto-add" trick — prevents accidental
-      vocabulary loss when the user edits the CSV)
-    - Reloads on file change (Talon already auto-reloads `.talon` files;
-      CSV reload is a watcher pattern)
+23. **Migrate `delete-blocks` and `get-view`** callers from JS-side
+    cases to read `__state__` directly or call `bridge.clj`. Then
+    delete those JS cases. ~80 LoC reduction in `processCommand`.
 
-### Things to NOT do in Phase F
+24. **Add the AST resolver for `label` marks** on the JS side. The DOM
+    commands (`selectBlockHighlight`, `annotate`, `scan-blocks`) take
+    raw UID arrays today. Migrate them to take an AST list of label
+    marks, lifting the resolver from `bridge.clj` to JS for the
+    label-only subset.
 
-- **Don't delete legacy `bridge.clj` public fns yet.** Wait until daily
-  voice usage has confirmed every spoken-form variant works through the
-  new wire. Suggested sequence: live-use Phase E for ≥1 week, then in
-  Phase F or G start removing `select!`, `move!`, `transfer!`,
-  `swap-blocks!`, `nudge!`, `new-*!`, `fold!`/`unfold!`,
-  `zoom!`/`zoom-parent!`/`zoom-out!`, `delete!`, `open-sidebar!` (~25 fns).
-- **Don't touch `processCommand` in `agent-bridge.js`** — Phase G.
+### Things to NOT do in Phase G
+
+- **Don't delete legacy `bridge.clj` public fns yet.** Wait until ≥1
+  week of daily voice usage has confirmed every spoken-form variant
+  works through the new wire. ~25 fns to eventually remove: `select!`,
+  `select-add!`, `select-remove!`, `delete!`, `zoom!`, `zoom-parent!`,
+  `zoom-out!`, `fold!`, `unfold!`, `fold-children!`, `unfold-children!`,
+  `open-sidebar!`, `new-block!`, `new-sibling!`, `new-child!`,
+  `new-before!`, `new-after!`, `move!`, `link!`, `transfer!`,
+  `swap-blocks!`, `nudge!`.
 - **Don't add new actions / marks / modifiers** — Phase D is action-
-  complete. Phase F is vocabulary-externalization only.
-- **Don't delete `phase_e_smoke.talon`** until voice-verified. It's the
-  fallback validation harness if voice flow regresses.
+  complete; Phase G is JS-side cleanup only.
+- **Don't write to `__state__.pronouns`** from JS — pronouns live in
+  `/tmp/roam-bridge-pronouns-tmem.json` (bb-side). The 2s JS poll
+  would clobber any JS-side write.
+- **Don't daemonize** unless user explicitly asks (see deferred section).
+- **Don't delete `phase_e_smoke.talon`** until voice-verified.
 
-### Things to consider for Phase F
+### Things to consider for Phase G
 
 - The legacy `roam_destination_legacy` capture and `roam_source` /
   `roam_source_base` captures in `roam_tmem_ext.py` are dead code post-E
   (no active rules call them, except `print source <user.roam_source>`
-  debug rule). Safe to delete during Phase F vocab externalisation.
+  debug rule). Safe to delete in Phase G or any future cleanup pass.
 - The legacy bridge.clj public fns become deletion candidates once
-  Phase E voice flow is daily-verified. ~25 fns total. Ordering: delete
-  in groups, voice-test after each delete.
-- Daemon mode (deferred §) becomes worth revisiting if Phase F reveals
-  Talon-side latency annoyance.
+  Phase E+F voice flow is daily-verified. ~25 fns total. Ordering:
+  delete in groups, voice-test after each delete.
+- Daemon mode (deferred §) becomes worth revisiting if Phase G reveals
+  JS-side serialisation bottlenecks under heavy voice use.
 
 ---
 
-## Quick repo orientation (post-Phase E)
+## Quick repo orientation (post-Phase F)
 
 ```
 /Users/ryan/dev/tmem-roam-ext/
@@ -915,16 +992,26 @@ Per the plan §7 steps 19–20:
 └── /tmp/roam-bridge-cmd-*.json          ← Phase E voice-command envelopes
                                           (one per command, deleted post-execute)
 
-# Talon side (Phase E)
-/Users/ryan/.talon/user/ryan/roam/
-├── roam_tmem_ext.py             ← Phase E captures + Python actions
-├── hats.talon                   ← migrated: select/fold/zoom/sidebar/transfer/
-│                                  swap/nudge/delete via user.roam_action*
-├── tree_edit.talon              ← migrated: 12 new-block rules → roam_action_dest
-├── block_edit.talon             ← unchanged (text-editing within block, not
-│                                  action surface)
-├── phase_e_smoke.talon          ← TEMPORARY voice-verification harness
-└── (other .talon files)         ← unchanged (keystroke-only, no roam_fn calls)
+# Talon side (Phase E + F)
+/Users/ryan/.talon/user/
+├── roam-vocabulary/             ← Phase F: CSV-driven vocabulary
+│   ├── roam-pronouns.csv        ← 8 rows → user.roam_pronoun
+│   ├── roam-actions.csv         ← 12 rows → user.roam_action_verb
+│   └── roam-scopes.csv          ← 22 rows → user.roam_{containing,every,ordinal}_scope
+│                                  (Modifier kind column routes rows to lists)
+└── ryan/roam/
+    ├── roam_csv.py              ← Phase F loader: reads CSVs, populates ctx.lists,
+    │                              auto-adds missing canonical IDs, fs.watch reloads.
+    │                              Owns the 5 mod.list declarations.
+    ├── roam_tmem_ext.py         ← Phase E captures + Python actions; Phase F
+    │                              removed the externalised list ctx assignments.
+    ├── hats.talon               ← Phase E migration + Phase F generic rule
+    │                              `{user.roam_action_verb} <user.roam_target>`.
+    ├── tree_edit.talon          ← migrated: 12 new-block rules → roam_action_dest
+    ├── block_edit.talon         ← unchanged (text-editing within block, not
+    │                              action surface)
+    ├── phase_e_smoke.talon      ← TEMPORARY voice-verification harness
+    └── (other .talon files)     ← unchanged (keystroke-only, no roam_fn calls)
 ```
 
 ### nREPL ports (as of session)
@@ -959,4 +1046,4 @@ The bb ports may not be the same on next session — discover via
 
 ---
 
-*Last updated: 2026-04-26, end of Phase E.*
+*Last updated: 2026-04-26, end of Phase F.*
