@@ -316,11 +316,15 @@
          vec)))
 
 (defn- get-current-selection
-  "Get the current selection from the bridge via get-view (always fresh)."
-  [graph commands-uid]
-  (let [resp (send-command! graph commands-uid
-               (str "gv-" (System/currentTimeMillis)) "get-view" {})]
-    (vec (or (get-in resp [:result :selected]) []))))
+  "Get the current selection from the cached __state__ map.
+   Phase G step 23b: reads selection from the JS-poll-mirrored
+   __state__ block (already parsed and present in `state`) instead of
+   round-tripping through the JS `get-view` command. Saves ~250ms per
+   call. Up to 2s stale (the JS poll cadence), but every voice path
+   that mutates selection forces an immediate state-write JS-side, so
+   in practice the cache is fresh after every mutation."
+  [state]
+  (vec (or (:selected state) [])))
 
 ;; ── Core move/link operations (shared by all source types) ───────
 
@@ -1751,18 +1755,27 @@
     {:uids remaining :removed (vec rm-uids) :count (count remaining)}))
 
 (defmethod dispatch "remove"
-  [_ {:keys [target]} {:keys [graph commands-uid] :as ctx}]
+  ;; Phase G step 23a: deletes go directly via Roam Local API
+  ;; (data.block.delete) instead of round-tripping through the JS
+  ;; extension's `delete-blocks` command. Saves ~250ms (no __commands__
+  ;; write + JS poll wait) and removes one wire-format dependency.
+  [_ {:keys [target]} {:keys [graph] :as ctx}]
   (let [region (resolve-target-implicit ctx target "remove")
         uids   (mapv :uid region)]
     (when (empty? uids)
       (err "missing-slot" {:action "remove"
                            :reason "target resolved to no uids"}))
-    (let [resp (send-command! graph commands-uid
-                 (str "ex-rm-" (System/currentTimeMillis))
-                 "delete-blocks" {:uids uids})]
+    (let [deleted (->> uids
+                       (keep (fn [uid]
+                               (try
+                                 (roam-api graph "data.block.delete"
+                                           {"block" {"uid" uid}})
+                                 uid
+                                 (catch Exception _ nil))))
+                       vec)]
       {:uids uids
-       :deleted (or (get-in resp [:result :deleted]) uids)
-       :count (or (get-in resp [:result :count]) (count uids))})))
+       :deleted deleted
+       :count (count deleted)})))
 
 (defmethod dispatch "collapse"
   [_ {:keys [target]} {:keys [graph] :as ctx}]

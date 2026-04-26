@@ -11,7 +11,7 @@ after each phase completion.
 | C — Mark + modifier coverage | ✅ done | 2026-04-25 | All 9 mark kinds + pronouns + phrase. |
 | D — Action coverage by shape | ✅ done | 2026-04-26 | All 16 actions across 4 shapes. Legacy fns intact (Phase E re-points Talon). |
 | E — Talon surface | ✅ done | 2026-04-26 | `roam_mark`/`roam_modifier`/`roam_target`/`roam_destination` captures + `user.roam_action`/`_pair`/`_dest`/`_swap`/`_nudge` actions. `hats.talon` + `tree_edit.talon` migrated. |
-| F — Vocabulary externalisation | ✅ done | 2026-04-26 | 3 CSVs in `~/.talon/user/roam-vocabulary/` driven by `roam_csv.py` loader. Auto-add-on-missing + fs.watch reload. New `{user.roam_action_verb}` list collapses 6 single-target rules in `hats.talon` into 1 generic rule. |
+| F — Vocabulary externalisation | ✅ done | 2026-04-26 | 5 `.talon-list` files in `~/.talon/user/roam-vocabulary/` (native Talon auto-load, zero Python). New `{user.roam_action_verb}` list collapses 6 single-target rules in `hats.talon` into 1 generic rule. |
 | G — JS extension cleanup | ⏳ next | — | `version` enforcement + `labelsVersion` cache + drop `delete-blocks`/`get-view`. |
 | H — Embedded DSL | ⏳ optional | — | String-form subset for LLM path. |
 
@@ -424,7 +424,7 @@ once voice surface is fully verified by daily use.
 
 | Test | Verification | Result |
 |---|---|---|
-| CSV load + populate 5 lists | `roam_csv.populate_lists()` from a stubbed Talon environment; counted entries per list | ✓ pronoun=8, action_verb=12, containing=4, every=14, ordinal=4 |
+| List load (5 .talon-list files) | Talon auto-loads from `roam-vocabulary/*.talon-list`; counted entries per list | ✓ pronoun=8, action_verb=12, containing=4, every=14, ordinal=4 |
 | Legacy mapping preserved | Read `fold` from `roam-actions.csv` after load | ✓ resolves to `collapse` (intentional cross-mapping) |
 | Auto-add (lossy edit) | Stripped 10 of 12 rows from `roam-actions.csv`, called populate, checked CSV file | ✓ 8 default rows re-appended; `openInSidebar`/`expand`/`collapse`/`zoom` IDs all restored with their default spoken forms |
 | Auto-add (missing file) | `rm roam-actions.csv`, populate, check | ✓ file recreated with all 12 default rows; in-memory list size = 12 |
@@ -779,31 +779,28 @@ Schema destination §6 produces `{:order 0 | "last"}`. Roam's
 the method. Don't try to send `:first`/`:last` keywords to the API —
 they're internal to legacy `create-and-focus-block!`.
 
-### 17. Phase F: list declarations live in exactly one module
+### 17. Phase F: list declarations live in `.talon-list` files
 
-`mod.list("roam_pronoun", ...)` etc. now live in `roam_csv.py`. The
-captures referencing `{user.roam_pronoun}` etc. live in
-`roam_tmem_ext.py`. Talon resolves list names globally, so cross-file
-references work, but **only one module may declare a given list name**
-— double-declaration silently breaks list lookup. If you add a new CSV-
-driven list, declare it in `roam_csv.py` only.
+Each `.talon-list` file in `roam-vocabulary/` declares its own list via
+the `list: user.roam_*` header. Talon auto-loads these natively — no
+Python `mod.list()` or `ctx.lists[...]` assignment needed. The captures
+referencing `{user.roam_pronoun}` etc. live in `roam_tmem_ext.py`.
+Talon resolves list names globally, so cross-file references work.
+**Only one source may declare a given list name** — if you also declare
+it in Python, behaviour is undefined.
 
-### 18. Phase F: lists populate on `app.register("ready", ...)`
+### 18. Phase F: `.talon-list` files are hot-reloaded by Talon
 
-`roam_csv.py` defers `populate_lists()` until the Talon `ready` event
-fires (avoids race conditions with other modules). At module-import
-time, `ctx.lists["user.roam_*"]` are empty dicts. Voice commands can't
-fire pre-ready so this is invisible to users. **Don't run inline
-list-membership tests at module load** — they will see empty lists.
+Talon watches `.talon-list` files and reloads them on save. No Python
+`app.register("ready", ...)` dance needed. Lists are available as soon
+as Talon finishes loading the file.
 
-### 19. Phase F: auto-add restores ALL defaults for a missing canonical ID
+### 19. Phase F: no auto-add safety net (by design)
 
-When the user removes EVERY spoken form for a canonical ID from a CSV
-(e.g. drops both `bar,openInSidebar` and `sidebar,openInSidebar` rows),
-the loader re-adds **all** the default spoken forms for that ID, not
-just one. This is "soft restore" — generous repair, no canonical ID
-disappears. Removing one of two synonyms is safe (the ID still has
-≥1 row) and the loader won't touch the CSV.
+The original CSV loader had auto-add-on-missing logic. With native
+`.talon-list` files this is gone — if you delete a line, the spoken
+form is gone until you re-add it. This is acceptable because the files
+are version-controlled and you're the sole user.
 
 ### 20. Phase F: action-verb generic rule and rule-specificity
 
@@ -891,18 +888,16 @@ A→D phase_e_smoke.talon       (temporary voice-test harness — added Phase E,
                                  for the inline-dict-literal lesson it taught.)
 
 # Phase F (Talon side, in /Users/ryan/.talon/user/)
-A  roam-vocabulary/             (NEW directory mirroring cursorless-settings/)
-A  roam-vocabulary/roam-pronouns.csv  (8 rows, 1 list)
-A  roam-vocabulary/roam-actions.csv   (12 rows, 1 list — Phase F NEW list)
-A  roam-vocabulary/roam-scopes.csv    (22 rows, routes to 3 lists via 'Modifier kind' col)
-A  ryan/roam/roam_csv.py        (~250 lines: defaults dicts, CSV read/write,
-                                 populate_lists, auto-add-missing, fs.watch reload.
-                                 Owns the 5 mod.list declarations now.)
-M  ryan/roam/roam_tmem_ext.py   (-41 lines: removed 4 inline ctx.lists assignments
-                                 + 4 mod.list declarations for pronoun/containing/
-                                 every/ordinal — they live in roam_csv.py now.
-                                 Captures unchanged; Talon resolves list names
-                                 globally so cross-file references still work.)
+A  roam-vocabulary/                         (NEW directory)
+A  roam-vocabulary/roam_pronoun.talon-list          (8 rows)
+A  roam-vocabulary/roam_action_verb.talon-list      (12 rows)
+A  roam-vocabulary/roam_containing_scope.talon-list (4 rows)
+A  roam-vocabulary/roam_every_scope.talon-list      (14 rows)
+A  roam-vocabulary/roam_ordinal_scope.talon-list    (4 rows)
+D  ryan/roam/roam_csv.py        (DELETED — replaced by native .talon-list files)
+M  ryan/roam/roam_tmem_ext.py   (-41 lines: removed inline ctx.lists assignments
+                                 + mod.list declarations — now declared in
+                                 .talon-list file headers. Captures unchanged.)
 M  ryan/roam/hats.talon         (-2 lines net, +19/-21 footprint: collapsed 6
                                  single-target action rules into one generic
                                  `{user.roam_action_verb} <user.roam_target>`
@@ -1027,17 +1022,14 @@ Per the plan §7 steps 21–24:
 
 # Talon side (Phase E + F)
 /Users/ryan/.talon/user/
-├── roam-vocabulary/             ← Phase F: CSV-driven vocabulary
+├── roam-vocabulary/             ← Phase F: native .talon-list vocabulary
 │   ├── roam-pronouns.csv        ← 8 rows → user.roam_pronoun
 │   ├── roam-actions.csv         ← 12 rows → user.roam_action_verb
 │   └── roam-scopes.csv          ← 22 rows → user.roam_{containing,every,ordinal}_scope
 │                                  (Modifier kind column routes rows to lists)
 └── ryan/roam/
-    ├── roam_csv.py              ← Phase F loader: reads CSVs, populates ctx.lists,
-    │                              auto-adds missing canonical IDs, fs.watch reloads.
-    │                              Owns the 5 mod.list declarations.
-    ├── roam_tmem_ext.py         ← Phase E captures + Python actions; Phase F
-    │                              removed the externalised list ctx assignments.
+    │                              (roam_csv.py DELETED — .talon-list files are native)
+    ├── roam_tmem_ext.py         ← Phase E captures + Python actions.
     ├── hats.talon               ← Phase E migration + Phase F generic rule
     │                              `{user.roam_action_verb} <user.roam_target>`.
     ├── tree_edit.talon          ← migrated: 12 new-block rules → roam_action_dest
