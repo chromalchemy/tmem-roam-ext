@@ -127,8 +127,9 @@
     (json/parse-string s true)))
 
 (defn send-command! [graph commands-uid cmd-id cmd-type args]
+  ;; Phase A: every command carries :version 1. See docs/COMMAND-SCHEMA.md §1.
   (roam-create-block graph commands-uid
-    (json/generate-string {:id cmd-id :type cmd-type :args args}))
+    (json/generate-string {:version 1 :id cmd-id :type cmd-type :args args}))
   (loop [i 0]
     (when (>= i 60)
       (throw (ex-info "Bridge timeout" {:cmd-id cmd-id})))
@@ -232,10 +233,14 @@
       (>= depth 50)           false ;; safety limit
       :else (recur (get-parent-uid graph cur) (inc depth)))))
 
-(defn resolve-target
-  "Resolve a target map to {:uid, :name, :order, :anchor-uid}.
+(defn resolve-destination-legacy
+  "Resolve a destination spec map to {:uid, :name, :order, :anchor-uid}.
    target: {:label :D}, {:uid \"...\"}, {:page \"...\"}, {:before :B}, {:after :B}
-   default-order: :first or :last"
+   default-order: :first or :last
+
+   Phase B note: renamed from resolve-target to free that name for the new
+   AST-based resolver in §2 of docs/COMMAND-SCHEMA.md. Will be removed in
+   Phase D once moveToTarget/insertNewBlock take destination AST."
   [graph state target default-order]
   (let [anchor-label  (or (:before target) (:after target))
         anchor-uid    (when anchor-label (resolve-uid state anchor-label))
@@ -397,7 +402,7 @@
    target-map, order, alias? as before."
   [graph state source target-map order alias?]
   (let [uids (resolve-source-uids graph state source)
-        tgt  (resolve-target graph state target-map order)]
+        tgt  (resolve-destination-legacy graph state target-map order)]
     (when (seq uids)
       (move-uids! graph uids tgt alias?))))
 
@@ -405,7 +410,7 @@
   "Unified link: resolve sources and target, then create refs."
   [graph state source target-map order]
   (let [uids (resolve-source-uids graph state source)
-        tgt  (resolve-target graph state target-map order)]
+        tgt  (resolve-destination-legacy graph state target-map order)]
     (when (seq uids)
       (link-uids! graph uids tgt))))
 
@@ -1161,3 +1166,514 @@
                         (roam-move-block graph uid nxt "first")
                         (println (str "➡⬇ " block-name " indented under next sibling")))
                       (println (str "⚠️  " block-name " no next sibling")))))))
+
+;; ════════════════════════════════════════════════════════════════════════
+;; ── Phase B+C: Composable resolver spine ────────────────────────────────
+;; ════════════════════════════════════════════════════════════════════════
+;; AST-based mark / modifier / target resolver per docs/COMMAND-SCHEMA.md.
+;; Coexists with the legacy public API (select!, move!, etc.); existing
+;; call sites are untouched. Dispatch implements only the setSelection
+;; action — full action coverage lands in Phase D.
+;;
+;; Resolver ctx (single map threaded through every resolve-* / dispatch fn):
+;;   {:graph         "tmem"            ;; current graph name
+;;    :state         {…parsed __state__…}
+;;    :pronouns      {:that {:uids […]} :source {:uids […]}}
+;;    :commands-uid  "<uid>"           ;; for dispatch send-command!
+;;    :state-uid     "<uid>"
+;;    :destination?  false}            ;; gates the position modifier
+;;
+;; Region map shape: {:uid "..." :region "main"|"sidebar" :window-id "..."}
+;; Only :uid is guaranteed; other keys are populated when the resolver
+;; can derive them cheaply (e.g. label marks already carry :region).
+;; ════════════════════════════════════════════════════════════════════════
+
+(declare resolve-target)
+
+(defn- err
+  "Raise a tagged error. Code matches §9 of COMMAND-SCHEMA.md."
+  [code data]
+  (throw (ex-info code (assoc data :error code))))
+
+;; ── Pronoun persistence (Phase C step 7) ────────────────────────────────
+;; bb invocations are ephemeral; pronouns must survive across them so
+;; voice flows like "select A" → "now move that to D" work. Backed by a
+;; per-graph JSON file in the system tmpdir. The Phase G JS rewrite will
+;; eventually mirror these into __state__.pronouns for the agent side.
+
+(defn- pronouns-file [graph]
+  (str (System/getProperty "java.io.tmpdir")
+       "/roam-bridge-pronouns-" graph ".json"))
+
+(defn- load-pronouns [graph]
+  (let [f (pronouns-file graph)]
+    (if (fs/exists? f)
+      (try (json/parse-string (slurp f) true)
+           (catch Exception _ {}))
+      {})))
+
+(defn- save-pronouns! [graph p]
+  (spit (pronouns-file graph) (json/generate-string p)))
+
+(def ^:private pronouns-cache
+  "In-process cache to avoid re-reading the file per ctx call."
+  (atom {}))
+
+(defn- get-pronouns [graph]
+  (or (get @pronouns-cache graph)
+      (let [p (load-pronouns graph)]
+        (swap! pronouns-cache assoc graph p)
+        p)))
+
+(defn- update-pronouns! [graph f]
+  (let [updated (f (get-pronouns graph))]
+    (swap! pronouns-cache assoc graph updated)
+    (save-pronouns! graph updated)
+    updated))
+
+;; ── resolve-mark ─────────────────────────────────────────────────────────
+
+(defmulti resolve-mark*
+  "Resolve a mark AST node to a vec of region maps. Dispatch on :type (string).
+   ctx: {:graph :state :pronouns} — only the keys a given mark needs."
+  (fn [_ctx mark] (:type mark)))
+
+(defmethod resolve-mark* "label"
+  [{:keys [state]} {:keys [value]}]
+  (let [k (keyword (str/upper-case (str value)))
+        v (get-in state [:labels k])]
+    (cond
+      (nil? v) (err "mark-not-found"
+                    {:mark {:type "label" :value value}
+                     :available (some->> state :labels keys (map name) sort vec)})
+      (map? v) [{:uid (:uid v) :region (:region v)}]
+      :else    [{:uid v}])))
+
+(defmethod resolve-mark* "uid"
+  [_ctx {:keys [value]}]
+  [{:uid value}])
+
+(defmethod resolve-mark* "cursor"
+  [{:keys [state]} _]
+  (if-let [uid (get-in state [:focused :block-uid])]
+    [{:uid uid :window-id (get-in state [:focused :window-id])}]
+    (err "mark-not-found" {:mark {:type "cursor"}
+                           :reason "no focused block"})))
+
+(defmethod resolve-mark* "selection"
+  [{:keys [state]} _]
+  (mapv (fn [uid] {:uid uid}) (or (:selected state) [])))
+
+(defmethod resolve-mark* "pageTitle"
+  [{:keys [graph]} {:keys [value]}]
+  (if-let [uid (get-page-uid graph value)]
+    [{:uid uid :region "main" :page-title value}]
+    (err "mark-not-found"
+         {:mark {:type "pageTitle" :value value}
+          :reason "page does not exist"})))
+
+(defn- coerce-daily-value
+  "JSON sends strings; coerce 'today'/'next-mon'/etc to keywords,
+   bare integers to longs, MM-DD-YYYY strings stay as strings."
+  [v]
+  (cond
+    (or (keyword? v) (integer? v)) v
+    (and (string? v) (re-matches #"-?\d+" v)) (Long/parseLong v)
+    (and (string? v) (re-matches #"\d{2}-\d{2}-\d{4}" v)) v
+    (string? v) (keyword v)
+    :else v))
+
+(defmethod resolve-mark* "daily"
+  [{:keys [graph]} {:keys [value]}]
+  (let [coerced (coerce-daily-value value)
+        date    (resolve-daily-date coerced)
+        title   (roam-daily-title date)]
+    (if-let [uid (get-page-uid graph title)]
+      [{:uid uid :region "main" :page-title title :daily-value value}]
+      ;; Daily page may not exist yet. Phase D's insertNewBlock can create
+      ;; it on demand; for resolve-only marks we error with the title so
+      ;; callers know what to do.
+      (err "mark-not-found"
+           {:mark {:type "daily" :value value}
+            :resolved-title title
+            :reason "daily note page does not exist yet"}))))
+
+(defmethod resolve-mark* "that"
+  [{:keys [pronouns]} _]
+  (let [uids (get-in pronouns [:that :uids])]
+    (if (seq uids)
+      (mapv (fn [uid] {:uid uid}) uids)
+      (err "mark-not-found"
+           {:mark {:type "that"}
+            :reason "no prior command result"}))))
+
+(defmethod resolve-mark* "source"
+  [{:keys [pronouns]} _]
+  (let [uids (get-in pronouns [:source :uids])]
+    (if (seq uids)
+      (mapv (fn [uid] {:uid uid}) uids)
+      (err "mark-not-found"
+           {:mark {:type "source"}
+            :reason "no prior move/link source"}))))
+
+(defmethod resolve-mark* "phrase"
+  [{:keys [graph]} {:keys [value]}]
+  ;; Match is case-SENSITIVE — Roam's Datalog whitelist does not include
+  ;; clojure.string/lower-case (only ::includes? and a few predicates).
+  ;; If case-insensitive search becomes necessary, the fallback is a full
+  ;; pull + client-side filter, which is O(n) over all block strings.
+  (let [needle (str value)
+        rows   (roam-q graph
+                 (str "[:find ?uid
+                        :where
+                        [?b :block/string ?s]
+                        [(clojure.string/includes? ?s \"" (esc-dq needle) "\")]
+                        [?b :block/uid ?uid]]"))
+        uids   (mapv first rows)]
+    (if (seq uids)
+      (mapv (fn [uid] {:uid uid}) uids)
+      (err "mark-not-found"
+           {:mark {:type "phrase" :value value}
+            :reason "no blocks contain the phrase (case-sensitive)"}))))
+
+(defmethod resolve-mark* "placeholder" [_ {:keys [index]}]
+  (err "not-implemented" {:mark {:type "placeholder" :index index}
+                          :phase "H — embedded DSL"}))
+
+(defmethod resolve-mark* :default [_ mark]
+  (err "unknown-mark" {:mark mark}))
+
+(defn resolve-mark
+  "Public wrapper. ctx is the resolver context map (see header comment)."
+  [ctx mark]
+  (resolve-mark* ctx mark))
+
+;; ── apply-modifier ───────────────────────────────────────────────────────
+
+(defn- ascend-n
+  "Walk n parents up from uid. Returns nil if hitting top before n."
+  [graph uid n]
+  (loop [cur uid k n]
+    (cond
+      (nil? cur) nil
+      (zero? k)  cur
+      :else      (recur (get-parent-uid graph cur) (dec k)))))
+
+(defn- collect-descendants
+  "Pre-order descendant uids (excluding the root)."
+  [graph uid]
+  (let [cs (get-children-uids graph uid)]
+    (vec (concat cs (mapcat #(collect-descendants graph %) cs)))))
+
+(defn- ascend-to-page
+  "Walk to the page (no-parent) ancestor."
+  [graph uid]
+  (loop [cur uid depth 0]
+    (let [p (get-parent-uid graph cur)]
+      (cond
+        (nil? p)        cur
+        (>= depth 50)   (err "mark-not-found"
+                             {:reason "page walk too deep" :uid uid})
+        :else           (recur p (inc depth))))))
+
+(defn- ascend-to-top-level
+  "Walk up to the depth-1 ancestor (parent is the page)."
+  [graph uid]
+  (loop [cur uid depth 0]
+    (let [p (get-parent-uid graph cur)]
+      (cond
+        (nil? p)              cur ; cur is itself a page
+        (nil? (get-parent-uid graph p)) cur ; parent is a page → cur is top-level
+        (>= depth 50)         (err "mark-not-found"
+                                   {:reason "topLevel walk too deep" :uid uid})
+        :else                 (recur p (inc depth))))))
+
+(defmulti apply-modifier
+  "Apply a modifier to a region. ctx is {:graph :state :destination?}."
+  (fn [_ctx _region modifier] (:type modifier)))
+
+(defmethod apply-modifier "containing"
+  [{:keys [graph]} region {:keys [scope ancestorIndex]}]
+  (let [n (or ancestorIndex 1)]
+    (case scope
+      "parent"   (mapv (fn [{:keys [uid] :as r}]
+                         (if-let [a (ascend-n graph uid n)]
+                           (assoc r :uid a)
+                           (err "mark-not-found"
+                                {:modifier {:type "containing" :scope "parent"
+                                            :ancestorIndex n}
+                                 :uid uid})))
+                       region)
+      "page"     (mapv (fn [{:keys [uid] :as r}]
+                         (assoc r :uid (ascend-to-page graph uid)))
+                       region)
+      "topLevel" (mapv (fn [{:keys [uid] :as r}]
+                         (assoc r :uid (ascend-to-top-level graph uid)))
+                       region)
+      (err "unknown-scope" {:modifier {:type "containing" :scope scope}}))))
+
+(defmethod apply-modifier "every"
+  [{:keys [graph]} region {:keys [scope tag]}]
+  (case scope
+    "child"      (vec (mapcat (fn [{:keys [uid]}]
+                                (map #(hash-map :uid %) (get-children-uids graph uid)))
+                              region))
+    "descendant" (vec (mapcat (fn [{:keys [uid]}]
+                                (map #(hash-map :uid %) (collect-descendants graph uid)))
+                              region))
+    "sibling"    (vec (mapcat (fn [{:keys [uid]}]
+                                (let [p (get-parent-uid graph uid)
+                                      sibs (when p (get-children-uids graph p))]
+                                  (->> sibs (remove #(= % uid))
+                                       (map #(hash-map :uid %)))))
+                              region))
+    "reference"  (err "not-implemented"
+                      {:modifier {:type "every" :scope "reference"} :phase "D"})
+    "mention"    (err "not-implemented"
+                      {:modifier {:type "every" :scope "mention" :tag tag} :phase "D"})
+    (err "unknown-scope" {:modifier {:type "every" :scope scope}})))
+
+(defn- pick-by-index
+  "Negative index counts from end. Returns nil if out of bounds."
+  [items idx]
+  (let [n (count items)
+        i (if (neg? idx) (+ n idx) idx)]
+    (when (and (<= 0 i) (< i n))
+      (nth items i))))
+
+(defmethod apply-modifier "ordinal"
+  [{:keys [graph]} region {:keys [scope index]}]
+  (case scope
+    "child"   (vec (keep (fn [{:keys [uid]}]
+                           (when-let [c (pick-by-index (get-children-uids graph uid) index)]
+                             {:uid c}))
+                         region))
+    "sibling" (vec (keep (fn [{:keys [uid]}]
+                           (let [p (get-parent-uid graph uid)
+                                 sibs (when p (get-children-uids graph p))]
+                             (when-let [s (pick-by-index sibs index)]
+                               {:uid s})))
+                         region))
+    (err "unknown-scope" {:modifier {:type "ordinal" :scope scope}})))
+
+(defmethod apply-modifier "relative"
+  [{:keys [graph]} region {:keys [scope direction count] :or {count 1}}]
+  (case scope
+    "sibling" (vec (mapcat (fn [{:keys [uid]}]
+                             (let [p (get-parent-uid graph uid)
+                                   sibs (when p (get-children-uids graph p))
+                                   idx (when sibs (.indexOf sibs uid))
+                                   step (if (= direction "backward") -1 1)]
+                               (->> (range 1 (inc count))
+                                    (keep (fn [k]
+                                            (when (and sibs (>= idx 0))
+                                              (let [j (+ idx (* step k))]
+                                                (when (<= 0 j (dec (clojure.core/count sibs)))
+                                                  {:uid (nth sibs j)})))))
+                                    vec)))
+                           region))
+    (err "unknown-scope" {:modifier {:type "relative" :scope scope}})))
+
+(defmethod apply-modifier "head"
+  [{:keys [graph]} region {:keys [scope count]}]
+  (case scope
+    "child" (vec (mapcat (fn [{:keys [uid]}]
+                           (->> (get-children-uids graph uid)
+                                (take count)
+                                (map #(hash-map :uid %))))
+                         region))
+    (err "unknown-scope" {:modifier {:type "head" :scope scope}})))
+
+(defmethod apply-modifier "tail"
+  [{:keys [graph]} region {:keys [scope count]}]
+  (case scope
+    "child" (vec (mapcat (fn [{:keys [uid]}]
+                           (->> (get-children-uids graph uid)
+                                (take-last count)
+                                (map #(hash-map :uid %))))
+                         region))
+    (err "unknown-scope" {:modifier {:type "tail" :scope scope}})))
+
+(defmethod apply-modifier "position"
+  [{:keys [destination?]} region {:keys [at]}]
+  (when-not destination?
+    (err "position-on-target" {:modifier {:type "position" :at at}}))
+  (when-not (#{"start" "end"} at)
+    (err "unknown-scope" {:modifier {:type "position" :at at}}))
+  (mapv #(assoc % :position at) region))
+
+(defmethod apply-modifier :default [_ _ modifier]
+  (err "unknown-modifier" {:modifier modifier}))
+
+(defn- apply-modifiers [ctx region modifiers]
+  (reduce (fn [r m] (apply-modifier ctx r m))
+          region
+          (or modifiers [])))
+
+;; ── resolve-target ───────────────────────────────────────────────────────
+
+(defn resolve-target
+  "Resolve a target AST to a region vec.
+   ctx is the resolver context: {:graph :state :pronouns :destination?}.
+   Note: :destination? is consumed by apply-modifier (for the position
+   modifier gate); resolve-target itself just threads ctx through."
+  [{:keys [graph state] :as ctx} target]
+  (case (:type target)
+    "primitive" (apply-modifiers ctx
+                                 (resolve-mark ctx (:mark target))
+                                 (:modifiers target))
+    "list"      (vec (mapcat #(resolve-target ctx %) (:elements target)))
+    "range"     (let [{:keys [anchor active excludeAnchor excludeActive]} target
+                      ;; Range endpoints resolve as targets, not destinations.
+                      sub-ctx (assoc ctx :destination? false)
+                      ar (resolve-target sub-ctx anchor)
+                      br (resolve-target sub-ctx active)
+                      a-uid (:uid (first ar))
+                      b-uid (:uid (first br))
+                      ap (get-parent-uid graph a-uid)
+                      bp (get-parent-uid graph b-uid)]
+                  (when (or (nil? a-uid) (nil? b-uid))
+                    (err "mark-not-found"
+                         {:reason "range endpoint resolved to nothing"}))
+                  (when-not (= ap bp)
+                    (err "range-cross-parent"
+                         {:anchor a-uid :anchor-parent ap
+                          :active b-uid :active-parent bp}))
+                  (let [sibs (get-children-uids graph ap)
+                        ai (.indexOf sibs a-uid)
+                        bi (.indexOf sibs b-uid)
+                        [lo hi] (sort [ai bi])
+                        lo (if excludeAnchor (inc lo) lo)
+                        hi (if excludeActive (dec hi) hi)]
+                    (vec (->> sibs
+                              (drop lo)
+                              (take (inc (- hi lo)))
+                              (map #(hash-map :uid %))))))
+    "implicit"  (let [sel (or (:selected state) [])
+                      focus (get-in state [:focused :block-uid])]
+                  (cond
+                    (seq sel) (mapv (fn [uid] {:uid uid}) sel)
+                    focus     [{:uid focus
+                                :window-id (get-in state [:focused :window-id])}]
+                    :else     (err "mark-not-found"
+                                   {:mark {:type "implicit"}
+                                    :reason "no selection or cursor"})))
+    (err "unknown-target-type" {:target target})))
+
+;; ── dispatch + execute! ──────────────────────────────────────────────────
+
+(defmulti dispatch
+  "Dispatch a parsed action map. ctx is {:graph :commands-uid :state-uid :state}.
+   Dispatch key is the action name (string)."
+  (fn [name _action _ctx] name))
+
+(defmethod dispatch "setSelection"
+  [_ {:keys [target]} {:keys [graph commands-uid state] :as ctx}]
+  (when-not target
+    (err "missing-slot" {:action "setSelection" :slot "target"}))
+  (let [region (resolve-target ctx target)
+        uids   (mapv :uid region)
+        in-sidebar? (some #(= "sidebar" (:region %)) region)
+        wid    (if in-sidebar?
+                 (let [sw (find-sidebar-windows graph state (first uids))]
+                   (if (seq sw) (first sw) "main-window"))
+                 "main-window")]
+    (when (empty? uids)
+      (err "missing-slot" {:action "setSelection"
+                           :reason "target resolved to no uids"}))
+    (send-command! graph commands-uid
+      (str "ex-sel-" (System/currentTimeMillis))
+      "select-block"
+      {:uids uids :window_id wid :mode "focus"})
+    {:uids uids :window_id wid :count (count uids)}))
+
+(defmethod dispatch :default [name action _ctx]
+  (err "unknown-action" {:name name :action action}))
+
+;; ── Pronoun update hooks (Phase C step 7) ───────────────────────────────
+;; Actions whose source slot should populate the :source pronoun.
+(def ^:private source-slot-actions
+  #{"moveToTarget" "linkToTarget" "aliasMove"})
+
+(defn- update-pronouns-after!
+  "After a successful dispatch, mirror the operated-on uids into pronouns.
+   :that  ← uids the action acted on (returned in the dispatch result)
+   :source ← source-slot uids when the action carries a source slot"
+  [graph action result ctx]
+  (let [now    (System/currentTimeMillis)
+        uids   (some-> result :uids vec)
+        src    (when (contains? source-slot-actions (:name action))
+                 (when-let [s (:source action)]
+                   (try (mapv :uid (resolve-target ctx s))
+                        (catch Exception _ nil))))]
+    (update-pronouns! graph
+      (fn [p]
+        (cond-> p
+          uids (assoc :that {:uids uids :ts now :action (:name action)})
+          src  (assoc :source {:uids src :ts now :action (:name action)}))))))
+
+(defn execute!
+  "Execute a v1 envelope payload. payload is a parsed map with :version, :id,
+   :action keys. Returns the dispatch result map. Throws ex-info with
+   :error code on schema violations (see §9 of docs/COMMAND-SCHEMA.md)."
+  ([payload] (execute! payload {}))
+  ([payload {:keys [graph] :or {graph default-graph}}]
+   (let [{:keys [version action]} payload]
+     (when-not (= version 1)
+       (err "unknown-version" {:received version :supported [1]}))
+     (when-not (and (map? action) (string? (:name action)))
+       (err "missing-slot" {:reason "action.name (string) required"
+                            :action action}))
+     (let [{:keys [commands-uid state-uid]} (-bridge graph)
+           state    (read-state graph state-uid)
+           pronouns (get-pronouns graph)
+           ctx      {:graph graph
+                     :commands-uid commands-uid
+                     :state-uid state-uid
+                     :state state
+                     :pronouns pronouns
+                     :destination? false}
+           result   (dispatch (:name action) action ctx)]
+       (update-pronouns-after! graph action result ctx)
+       result))))
+
+(comment
+  ;; Phase B smoke test — round-trip a setSelection envelope to label A.
+  ;; Requires nav-mode to be on (run (hats-on!) first).
+  (execute! {:version 1
+             :id "phaseB-smoke"
+             :action {:name "setSelection"
+                      :target {:type "primitive"
+                               :mark {:type "label" :value "A"}}}})
+
+  ;; List with a modifier — select every child of A
+  (execute! {:version 1
+             :id "phaseB-modifier"
+             :action {:name "setSelection"
+                      :target {:type "primitive"
+                               :mark {:type "label" :value "A"}
+                               :modifiers [{:type "every" :scope "child"}]}}})
+
+  ;; Phase C — pageTitle mark
+  (execute! {:version 1 :id "phaseC-pageTitle"
+             :action {:name "setSelection"
+                      :target {:type "primitive"
+                               :mark {:type "pageTitle" :value "roam-agent/bridge"}}}})
+
+  ;; Phase C — daily mark (today)
+  (execute! {:version 1 :id "phaseC-daily"
+             :action {:name "setSelection"
+                      :target {:type "primitive"
+                               :mark {:type "daily" :value "today"}}}})
+
+  ;; Phase C — phrase mark (fuzzy match)
+  (execute! {:version 1 :id "phaseC-phrase"
+             :action {:name "setSelection"
+                      :target {:type "primitive"
+                               :mark {:type "phrase" :value "agent-bridge"}}}})
+
+  ;; Phase C — that pronoun (run after any other command)
+  (execute! {:version 1 :id "phaseC-that"
+             :action {:name "setSelection"
+                      :target {:type "primitive"
+                               :mark {:type "that"}}}}))

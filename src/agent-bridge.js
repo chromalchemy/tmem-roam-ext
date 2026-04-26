@@ -586,7 +586,7 @@ async function writeResponse(commandBlockUid, id, status, result) {
 }
 
 async function processCommand(commandBlockUid, cmd) {
-  const { id, type, args } = cmd;
+  const { id, type, args, version } = cmd;
 
   if (processedCommandIds.has(id)) return;
   processedCommandIds.add(id);
@@ -597,6 +597,27 @@ async function processCommand(commandBlockUid, cmd) {
     const arr = [...processedCommandIds];
     processedCommandIds = new Set(arr.slice(-400));
   }
+
+  // --- Phase A: schema lock (envelope version check) ---------------------
+  // See docs/COMMAND-SCHEMA.md §1.
+  // - Missing version: warn and continue (transitional grace; tightened in
+  //   Phase G).
+  // - Mismatched version: hard reject.
+  if (version === undefined) {
+    console.warn(
+      `[agent-bridge] command ${id} (type=${type}) is missing "version"; ` +
+        `treating as legacy. New clients MUST send {"version":1}. ` +
+        `See docs/COMMAND-SCHEMA.md.`
+    );
+  } else if (version !== 1) {
+    await writeResponse(commandBlockUid, id, "error", {
+      error: "unknown-version",
+      received: version,
+      supported: [1],
+    });
+    return;
+  }
+  // -----------------------------------------------------------------------
 
   try {
     switch (type) {

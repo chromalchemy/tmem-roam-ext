@@ -42,7 +42,8 @@
 (defn send-eval! [code]
   (let [cmd-uid (find-commands-uid)
         cmd-id  (str "probe-" (System/currentTimeMillis))
-        cmd     (json/generate-string {:id cmd-id :type "eval" :args {:code code}})]
+        ;; Phase A: every command carries :version 1. See docs/COMMAND-SCHEMA.md §1.
+        cmd     (json/generate-string {:version 1 :id cmd-id :type "eval" :args {:code code}})]
     (roam-api "data.block.create"
               {"location" {"parent-uid" cmd-uid "order" "last"}
                "block"    {"string" cmd}})
