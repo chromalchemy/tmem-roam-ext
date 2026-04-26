@@ -816,6 +816,37 @@ adding a new compound rule whose first word is also a CSV action verb
 specificity the behaviour is engine-defined. Run the generic rule's
 spoken form first to confirm dispatch.
 
+### 21. TalonScript bodies cannot contain inline dict/list literals
+
+TalonScript (the body language of `.talon` files) is **not Python**.
+Its argument grammar accepts only `STRING | LONG_STRING | NAME | NUMBER
+| BOOLEAN`. An inline `{...}` or `[...]` literal raises a Lark
+`UnexpectedToken` at file-load time and the rule is silently skipped:
+
+```
+ERROR Failed to parse TalonScript in "..." for "(phase | face) smoke take that"
+   user.roam_action("setSelection", {"type":"primitive","mark":{"type":"that"}})
+                                    ^ Expected: BOOLEAN, LONG_STRING, NAME, NUMBER, STRING
+```
+
+The file as a whole still loads — just with the broken rules dropped —
+which makes this hard to spot: `phase smoke take A` works, `phase
+smoke take that` fails *silently* with no voice acknowledgment.
+
+**Discovery path**: `tail -f ~/.talon/talon.log` after a save catches
+the parse error immediately.
+
+**Fix**: never hand-build dict/list literals in `.talon` bodies. Either
+(a) use the production captures (`<user.roam_target>`,
+`<user.roam_destination>`) which build the dict in Python and pass it
+through transparently, or (b) call a Python helper action that builds
+the dict from positional args.
+
+This bit Phase E's smoke harness — 4 of 8 rules used inline dicts and
+all 4 silently failed. Caught during voice verification at end of
+Phase F. The smoke file (now deleted) was rewritten using captures
+only and all 8 rules passed.
+
 ---
 
 ## Files modified (cumulative)
@@ -854,8 +885,10 @@ M  hats.talon                   (rewrote 30+ rules across select/fold/zoom/sideb
 M  tree_edit.talon              (12 new-block roam_fn rules → 12 inline-dict
                                  rules calling user.roam_action_dest. Spoken
                                  forms preserved; only the wire layer changed.)
-A  phase_e_smoke.talon          (temporary — voice-test rules for new captures.
-                                 Delete after voice flow confirmed.)
+A→D phase_e_smoke.talon       (temporary voice-test harness — added Phase E,
+                                 deleted post-Phase-F after voice verification.
+                                 Not committed at any point. See gotcha §21
+                                 for the inline-dict-literal lesson it taught.)
 
 # Phase F (Talon side, in /Users/ryan/.talon/user/)
 A  roam-vocabulary/             (NEW directory mirroring cursorless-settings/)
@@ -889,24 +922,25 @@ at end of session.
 
 ### Pre-flight checklist
 
-1. **Voice-verify Phase E + F first.** `phase_e_smoke.talon` lives at
-   `/Users/ryan/.talon/user/ryan/roam/phase_e_smoke.talon`. Speak each
-   of its 8 rules in a Roam window with `hats-on!` active. Then
-   verify the new generic action-verb rule (Phase F) works: speak
-   `chuck A`, `take A`, `fold A`, `zoom A`, `bar A`, `mark A` — each
-   should produce the expected envelope (visible in
-   `/tmp/roam-bridge-cmd-*.json` if you suppress the auto-delete by
-   patching `execute-from-file!` to `(println path)` before delete).
-   If anything fails, the wire is solid (verified via simulated
-   envelopes); the issue is in Talon's capture grammar.
+1. ✅ **Phase E + F voice flow verified end-to-end** (2026-04-26).
+   The smoke file (`phase_e_smoke.talon`) is gone — all 8 rules passed
+   after rewriting to use production captures (the original 4 rules
+   that hand-built dict literals failed silently due to gotcha §21
+   above; this is the canonical example of why that gotcha matters).
+   Voice paths verified:
+   - Phase F generic rule `{user.roam_action_verb} <user.roam_target>`:
+     `take A`, `mark A`, `fold A`, `zoom A`, `bar A`, `chuck A` ✓
+   - Pronoun via target capture: `phase smoke take that`,
+     `phase smoke remove that` ✓
+   - Modifier chain: `phase smoke take every child of <letter>` ✓
+   - Destination capture (full chain): `phase smoke insert to end of
+     <letter>` ✓ (note: spoken form is "**to** end of", not "at end
+     of" — `at` isn't in `roam_insertion_mode`)
 
-2. **Delete the smoke file** once voice flow is confirmed:
-   `rm /Users/ryan/.talon/user/ryan/roam/phase_e_smoke.talon`.
-
-3. **Read** `docs/COMPOSABLE-REFACTOR-PLAN.md` §7 Phase G (steps 21–24)
+2. **Read** `docs/COMPOSABLE-REFACTOR-PLAN.md` §7 Phase G (steps 21–24)
    and §6 (JS extension cleanup target).
 
-4. **Confirm bridge still works**:
+3. **Confirm bridge still works**:
    ```bash
    cat <<'EOF' > /tmp/roam-cmd-pf.json
    {"version":1,"id":"preflight-G","action":{"name":"setSelection","target":{"type":"primitive","mark":{"type":"label","value":"A"}}}}
@@ -954,7 +988,6 @@ Per the plan §7 steps 21–24:
   `/tmp/roam-bridge-pronouns-tmem.json` (bb-side). The 2s JS poll
   would clobber any JS-side write.
 - **Don't daemonize** unless user explicitly asks (see deferred section).
-- **Don't delete `phase_e_smoke.talon`** until voice-verified.
 
 ### Things to consider for Phase G
 
@@ -1010,8 +1043,9 @@ Per the plan §7 steps 21–24:
     ├── tree_edit.talon          ← migrated: 12 new-block rules → roam_action_dest
     ├── block_edit.talon         ← unchanged (text-editing within block, not
     │                              action surface)
-    ├── phase_e_smoke.talon      ← TEMPORARY voice-verification harness
     └── (other .talon files)     ← unchanged (keystroke-only, no roam_fn calls)
+                                   (phase_e_smoke.talon deleted post-Phase F
+                                   voice verification — see gotcha §21)
 ```
 
 ### nREPL ports (as of session)
@@ -1046,4 +1080,5 @@ The bb ports may not be the same on next session — discover via
 
 ---
 
-*Last updated: 2026-04-26, end of Phase F.*
+*Last updated: 2026-04-26, post-Phase-F voice verification (Phase E + F voice
+paths fully validated; smoke file deleted; gotcha §21 added).*
