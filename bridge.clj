@@ -1718,10 +1718,10 @@
     {:uids uids :window_id wid :count (count uids)}))
 
 (defmethod dispatch "addToSelection"
-  [_ {:keys [target]} {:keys [graph commands-uid] :as ctx}]
+  [_ {:keys [target]} {:keys [graph commands-uid state] :as ctx}]
   (let [region   (resolve-target-implicit ctx target "addToSelection")
         new-uids (mapv :uid region)
-        current  (get-current-selection graph commands-uid)
+        current  (get-current-selection state)
         combined (vec (distinct (concat current new-uids)))
         wid      (pick-window-id ctx region)]
     (when (empty? new-uids)
@@ -1734,10 +1734,10 @@
     {:uids combined :added new-uids :count (count combined)}))
 
 (defmethod dispatch "removeFromSelection"
-  [_ {:keys [target]} {:keys [graph commands-uid] :as ctx}]
+  [_ {:keys [target]} {:keys [graph commands-uid state] :as ctx}]
   (let [region    (resolve-target-implicit ctx target "removeFromSelection")
         rm-uids   (set (mapv :uid region))
-        current   (get-current-selection graph commands-uid)
+        current   (get-current-selection state)
         remaining (vec (remove rm-uids current))
         wid       (pick-window-id ctx region)]
     (when (empty? rm-uids)
